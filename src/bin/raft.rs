@@ -534,8 +534,7 @@ impl Raft {
                 if next_index > self.log.len() {
                     continue;
                 }
-                let entries = self.log.entries[next_index - 1..].to_vec();
-                if !entries.is_empty() || elapsed_time >= self.heartbeat_interval {
+                if next_index <= self.log.entries.len() || elapsed_time >= self.heartbeat_interval {
                     replicated = true;
                     self.log(format!("Replicating log #{}+ to {}", next_index, node_id));
                     let rx = self
@@ -548,7 +547,7 @@ impl Raft {
                                 "leader_id": self.node.get_node_id(),
                                 "prev_log_index": next_index - 1 ,
                                 "prev_log_term": self.log[next_index - 1].term,
-                                "entries": entries,
+                                "entries": self.log.entries[next_index - 1..], // entries,
                                 "leader_commit": self.commit_index,
                             }),
                         )
