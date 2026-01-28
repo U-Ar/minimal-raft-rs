@@ -4,11 +4,23 @@ use std::{
 };
 
 use async_trait::async_trait;
+use env_logger::Env;
+use log::debug;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncBufReadExt,
     sync::{Mutex, OnceCell, mpsc, oneshot},
 };
+
+pub fn init_logger() {
+    let env = if cfg!(debug_assertions) {
+        Env::default().default_filter_or("debug")
+    } else {
+        Env::default().default_filter_or("info")
+    };
+
+    env_logger::Builder::from_env(env).init();
+}
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Message {
@@ -154,15 +166,12 @@ impl Node {
 
     pub async fn handle(&self, message: &Message) {
         if let Some(in_reply_to) = message.body.get("in_reply_to") {
-            self.log(format!(
-                "Handling reply to msg_id {}",
-                in_reply_to.as_u64().unwrap()
-            ));
+            debug!("Handling reply to msg_id {}", in_reply_to.as_u64().unwrap());
             let msg_id = in_reply_to.as_u64().unwrap();
             let mut callbacks = self.inner.callbacks.lock().await;
             if let Some(tx) = callbacks.remove(&msg_id) {
                 let _ = tx.send(message.clone()).await;
-                self.log(format!("Delivered reply to handler for msg_id {}", msg_id));
+                debug!("Delivered reply to handler for msg_id {}", msg_id);
                 return;
             }
         }
@@ -170,11 +179,11 @@ impl Node {
         let msg_type = message.body.get("type").unwrap().as_str().unwrap();
         if let Some(handler) = self.inner.handler.get() {
             if let Err(e) = handler.handle(self.clone(), message).await {
-                self.log(format!("Error handling message: {:?}", e));
+                debug!("Error handling message: {:?}", e);
                 self.reply(message, e.to_json()).await;
             }
         } else {
-            self.log(format!("No handler for message type: {:?}", msg_type));
+            debug!("No handler for message type: {:?}", msg_type);
             self.reply(
                 message,
                 RPCError::NotSupported("Operation not supported".to_string()).to_json(),
@@ -244,10 +253,7 @@ impl Node {
                 self.send(dest, send_body).await;
             }
             _ => {
-                self.log(format!(
-                    "Message body to {} must be a JSON object: {:?}",
-                    dest, body
-                ));
+                debug!("Message body to {} must be a JSON object: {:?}", dest, body);
             }
         };
     }
@@ -266,14 +272,6 @@ impl Node {
         }
     }
 
-    #[cfg(debug_assertions)]
-    pub fn log(&self, message: impl AsRef<str>) {
-        eprintln!("{}", message.as_ref());
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn log(&self, _message: impl AsRef<str>) {}
-
     pub async fn send(&self, dest: &str, body: serde_json::Value) {
         // TODO: 出力を専用チャンネルで非同期処理
         let out_message = Message {
@@ -284,10 +282,10 @@ impl Node {
         if let Some(print_sender) = self.inner.print_sender.get() {
             let out_json = serde_json::to_value(&out_message).unwrap();
             if let Err(err) = print_sender.send(out_json).await {
-                self.log(format!("Failed to send message to print channel: {}", err));
+                debug!("Failed to send message to print channel: {}", err);
             }
         } else {
-            self.log("Print sender not initialized");
+            debug!("Print sender not initialized");
         }
     }
 
@@ -305,10 +303,10 @@ impl Node {
                 self.send(reply_dest, send_body).await;
             }
             _ => {
-                self.log(format!(
+                debug!(
                     "Reply body to {} must be a JSON object: {:?}",
                     reply_dest, body
-                ));
+                );
             }
         }
     }
@@ -323,7 +321,7 @@ impl Node {
             )
             .await;
         } else {
-            self.log("Cannot reply_ok: message has no type field");
+            debug!("Cannot reply_ok: message has no type field");
         }
     }
 
@@ -343,14 +341,14 @@ impl Node {
         while let Ok(Some(line)) = lines.next_line().await {
             let ptr = self.clone();
             tokio::spawn(async move {
-                ptr.log(format!("Received: \"{}\"", line.escape_default()));
+                debug!("Received: \"{}\"", line.escape_default());
 
                 match serde_json::from_str(&line) as Result<Message, _> {
                     Ok(message) => {
                         ptr.handle(&message).await;
                     }
                     Err(e) => {
-                        ptr.log(format!("Error parsing JSON: {}", e));
+                        debug!("Error parsing JSON: {}", e);
                     }
                 };
             });

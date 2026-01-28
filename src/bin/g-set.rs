@@ -2,7 +2,8 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request};
+use log::debug;
+use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request, init_logger};
 use tokio::sync::Mutex;
 
 struct GSetHandler {
@@ -25,7 +26,7 @@ impl Handler for GSetHandler {
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                        node.log("emit replication signal");
+                        debug!("emit replication signal");
                         let inner = h0.lock().await;
                         for dest in n0.get_membership().node_ids.iter() {
                             if dest == n0.get_node_id() {
@@ -94,6 +95,7 @@ impl GSetHandler {
 }
 
 fn main() {
+    init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(GSetHandler::new()));
     node.run();

@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request};
+use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request, init_logger};
 use tokio::sync::Mutex;
 
 const LIN_KV_ROOT_KEY: &str = "root";
@@ -244,6 +244,7 @@ impl Handler for DatomicHandler {
 }
 
 fn main() {
+    init_logger();
     let node = Arc::new(Node::new());
     let handler = Arc::new(DatomicHandler::new());
     node.set_handler(handler);

@@ -1,7 +1,8 @@
 use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request};
+use log::debug;
+use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request, init_logger};
 use tokio::sync::Mutex;
 
 struct BroadcastHandler {
@@ -29,11 +30,11 @@ impl Handler for BroadcastHandler {
                     .unwrap_or_default();
                 let mut inner = self.inner.lock().await;
                 inner.neighbors = neighbors;
-                node.log(format!(
+                debug!(
                     "Set neighbors for node {}: {:?}",
                     node.get_node_id(),
                     inner.neighbors
-                ));
+                );
                 node.reply_ok(message).await;
             }
             Request::Broadcast { message: msg } => {
@@ -63,17 +64,14 @@ impl Handler for BroadcastHandler {
                     for neighbor_rx in neighbors {
                         let reply = neighbor_rx.await;
                         if let Ok(reply) = reply {
-                            node.log(format!(
-                                "Received reply from neighbor {}: {:?}",
-                                msg, reply.body
-                            ));
+                            debug!("Received reply from neighbor {}: {:?}", msg, reply.body);
                         }
                     }
-                    node.log(format!(
+                    debug!(
                         "Node {} broadcasted message {} to neighbors successfully",
                         node.get_node_id(),
                         msg
-                    ));
+                    );
                 }
             }
             Request::Read {} => {
@@ -109,6 +107,7 @@ impl BroadcastHandler {
 }
 
 fn main() {
+    init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(BroadcastHandler::new()));
     node.run();

@@ -2,7 +2,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request};
+use log::debug;
+use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request, init_logger};
 use tokio::sync::Mutex;
 
 struct GCounterHandler {
@@ -56,7 +57,7 @@ impl Handler for GCounterHandler {
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                        node.log("emit replication signal");
+                        debug!("emit replication signal");
                         let inner = h0.lock().await;
                         for dest in n0.get_membership().node_ids.iter() {
                             if dest == n0.get_node_id() {
@@ -144,6 +145,7 @@ impl GCounterHandler {
 }
 
 fn main() {
+    init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(GCounterHandler::new()));
     node.run();

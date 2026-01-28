@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request};
+use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request, init_logger};
 
 struct EchoHandler {}
 
@@ -36,6 +36,7 @@ impl Handler for EchoHandler {
 }
 
 fn main() {
+    init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(EchoHandler {}));
     node.run();

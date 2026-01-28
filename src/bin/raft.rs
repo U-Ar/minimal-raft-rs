@@ -9,8 +9,9 @@ use std::{
 };
 
 use async_trait::async_trait;
+use log::{debug, info};
+use minimal_raft_rs::node::{Handler, Message, Node, RPCError, init_logger};
 use rand::{self};
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -142,13 +143,13 @@ impl Raft {
     pub fn start(node: Node) -> mpsc::Sender<RaftRequest> {
         let (tx0, mut rx0) = mpsc::channel::<RaftRequest>(100);
         let tx1 = tx0.clone();
-        node.log("Raft instance handling starting...");
+        info!("Raft instance handling starting...");
         tokio::spawn(async move {
             let mut raft = Raft::new(node, tx0);
             loop {
-                raft.log("Waiting for Raft request...");
+                debug!("Waiting for Raft request...");
                 if let Some(message) = rx0.recv().await {
-                    raft.log("Received Raft request");
+                    debug!("Received Raft request");
                     let _ = raft.handle_request(message).await;
                 }
             }
@@ -180,14 +181,6 @@ impl Raft {
             log: RaftLog::new(),
         }
     }
-
-    #[cfg(debug_assertions)]
-    pub fn log(&self, arg: impl AsRef<str>) {
-        self.node.log(arg);
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn log(&self, _arg: impl AsRef<str>) {}
 
     pub fn get_term(&self) -> u64 {
         self.term
@@ -260,8 +253,7 @@ impl Raft {
         self.reset_step_down_deadline();
 
         self.advance_term(self.term + 1);
-        self.node
-            .log(format!("Becoming candidate for term {}", self.term));
+        debug!("Becoming candidate for term {}", self.term);
         self.request_votes().await;
     }
 
@@ -273,7 +265,7 @@ impl Raft {
 
         self.reset_election_deadline();
         self.cancel_election();
-        self.log(format!("Became follower for term {}", self.term));
+        debug!("Became follower for term {}", self.term);
     }
 
     pub fn become_leader(&mut self) {
@@ -291,8 +283,7 @@ impl Raft {
         }
 
         self.reset_step_down_deadline();
-        self.node
-            .log(format!("Became leader for term {}", self.term));
+        debug!("Became leader for term {}", self.term);
         self.cancel_election();
     }
 
@@ -430,10 +421,10 @@ impl Raft {
 
     pub fn maybe_step_down(&mut self, remote_term: u64) {
         if remote_term > self.term {
-            self.node.log(format!(
+            debug!(
                 "Stepping down: remote term {} is higher than current term {}",
                 remote_term, self.term
-            ));
+            );
             self.advance_term(remote_term);
             self.become_follower();
         }
@@ -459,10 +450,10 @@ impl Raft {
         let peers = self.node.get_membership().node_ids.len() - 1;
         let (tx, mut rx) = mpsc::channel::<Message>(peers);
 
-        self.log(format!(
+        debug!(
             "Requesting votes from peers, term: {}, last_log_index: {}, last_log_term: {}",
             self.term, last_log_index, last_log_term
-        ));
+        );
 
         self.refresh_election_state();
         let cancellation_token = self.cancellation_token.clone();
@@ -524,7 +515,7 @@ impl Raft {
         let mut replicated = false;
 
         if self.is_leader() && (elapsed_time >= self.min_replication_interval || force) {
-            self.log("Replication interval reached, replicating logs to followers");
+            debug!("Replication interval reached, replicating logs to followers");
             for node_id in self.node.get_membership().node_ids.iter() {
                 if node_id == self.node.get_node_id() {
                     continue;
@@ -536,7 +527,7 @@ impl Raft {
                 }
                 if next_index <= self.log.entries.len() || elapsed_time >= self.heartbeat_interval {
                     replicated = true;
-                    self.log(format!("Replicating log #{}+ to {}", next_index, node_id));
+                    debug!("Replicating log #{}+ to {}", next_index, node_id);
                     let rx = self
                         .node
                         .rpc(
@@ -568,7 +559,7 @@ impl Raft {
                                 }
                             }
                             Err(_) => {
-                                eprintln!("Vote response channel closed");
+                                debug!("Vote response channel closed");
                             }
                         }
                     });
@@ -638,10 +629,7 @@ impl Raft {
                 msg_id,
                 key,
             } => {
-                self.log(format!(
-                    "Received read request from {} for key {}",
-                    request.src, key
-                ));
+                debug!("Received read request from {} for key {}", request.src, key);
                 if self.is_leader() {
                     self.log.append(RaftLogEntry {
                         term: self.get_term(),
@@ -683,10 +671,10 @@ impl Raft {
             } => {
                 if self.is_leader() {
                     force_replicate = true;
-                    self.log(format!(
+                    debug!(
                         "Received write request from {} for key {}, value {}",
                         request.src, key, value
-                    ));
+                    );
                     self.log.append(RaftLogEntry {
                         term: self.get_term(),
                         src: request.src.clone(),
@@ -728,10 +716,10 @@ impl Raft {
             } => {
                 if self.is_leader() {
                     force_replicate = true;
-                    self.log(format!(
+                    debug!(
                         "Received cas request from {} for key {}, from {}, to {}",
                         request.src, key, from, to
-                    ));
+                    );
                     self.log.append(RaftLogEntry {
                         term: self.get_term(),
                         src: request.src.clone(),
@@ -771,32 +759,30 @@ impl Raft {
                 last_log_index,
                 last_log_term,
             } => {
-                self.node.log(format!(
+                debug!(
                     "Received vote request from {} for term {}",
                     candidate_id, term
-                ));
+                );
                 self.maybe_step_down(*term);
 
                 let mut vote_granted = false;
                 if *term < self.get_term() {
-                    self.node.log(format!(
+                    debug!(
                         "Candidate term {} is less than current term {}",
                         term,
                         self.get_term()
-                    ));
+                    );
                 } else if self.is_voted() && self.get_voted_for() != *candidate_id {
-                    self.node
-                        .log(format!("Already voted for {}", self.get_voted_for()));
+                    debug!("Already voted for {}", self.get_voted_for());
                 } else if !self
                     .is_candidate_log_up_to_date(*last_log_index as usize, *last_log_term)
                 {
-                    self.node.log(format!(
+                    debug!(
                         "Our logs are both at term {}, but candidate's log is not up-to-date",
                         last_log_term
-                    ));
+                    );
                 } else {
-                    self.node
-                        .log(format!("Voted for candidate {}", candidate_id));
+                    debug!("Voted for candidate {}", candidate_id);
                     vote_granted = true;
                     self.set_voted_for(candidate_id.clone());
                     self.reset_election_deadline();
@@ -813,9 +799,9 @@ impl Raft {
                 }
             }
             LinKvRequest::StartElection {} => {
-                self.node.log("Received periodic election check");
+                debug!("Received periodic election check");
                 if self.passed_election_deadline() {
-                    self.node.log("Election deadline passed, starting election");
+                    debug!("Election deadline passed, starting election");
                     if self.is_leader() {
                         self.reset_election_deadline();
                     } else {
@@ -824,26 +810,21 @@ impl Raft {
                 }
             }
             LinKvRequest::RequestVoteRes { term, vote_granted } => {
-                self.log(format!(
-                    "Received vote response for term {}: {}",
-                    term, vote_granted
-                ));
+                debug!("Received vote response for term {}: {}", term, vote_granted);
                 self.reset_step_down_deadline();
                 self.maybe_step_down(*term);
                 if self.is_candidate() && self.term == *term && *vote_granted {
-                    self.node.log(format!("Received vote from {}", request.src));
+                    debug!("Received vote from {}", request.src);
                     self.votes.insert(request.src);
                     if self.votes.len() >= majority(self.node.get_membership().node_ids.len()) {
-                        self.node
-                            .log(format!("Becoming leader for term {}", self.term));
+                        debug!("Becoming leader for term {}", self.term);
                         self.become_leader();
                     }
                 }
             }
             LinKvRequest::CheckStepDown {} => {
                 if self.is_leader() && Instant::now() >= self.step_down_deadline {
-                    self.node
-                        .log("Stepping down: haven't received acks from followers recently");
+                    debug!("Stepping down: haven't received acks from followers recently");
                     self.become_follower();
                 }
             }
@@ -855,15 +836,15 @@ impl Raft {
                 entries,
                 leader_commit,
             } => {
-                self.log(format!(
+                debug!(
                     "Received append entries from leader {} for term {}, prev_log_index {}, prev_log_term {}, leader_commit {}",
                     leader_id, term, prev_log_index, prev_log_term, leader_commit
-                ));
-                self.log(format!(
+                );
+                debug!(
                     "Current term {}, log length {}",
                     self.get_term(),
                     self.log.len()
-                ));
+                );
 
                 self.maybe_step_down(*term);
 
@@ -933,10 +914,10 @@ impl Raft {
                 success,
                 next_index,
             } => {
-                self.log(format!(
+                debug!(
                     "Received append entries response for term {}: success={}, next_index {}",
                     term, success, next_index
-                ));
+                );
                 self.maybe_step_down(*term);
                 if self.is_leader() && self.term == *term {
                     self.reset_step_down_deadline();
@@ -1082,11 +1063,11 @@ impl Handler for RaftHandler {
         match &body {
             LinKvRequest::Init { node_id, node_ids } => {
                 node.init(message, node_id.clone(), node_ids.clone()).await;
-                node.log("Initialized node. starting Raft instance...");
+                debug!("Initialized node. starting Raft instance...");
                 self.raft_sender
                     .set(Raft::start(node.clone()))
                     .unwrap_or_default();
-                node.log("Raft instance started.");
+                debug!("Raft instance started.");
                 let _ = self
                     .raft_sender
                     .get()
@@ -1203,6 +1184,7 @@ impl Handler for RaftHandler {
 }
 
 fn main() {
+    init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(RaftHandler::new()));
     node.run();
