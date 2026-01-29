@@ -1,4 +1,4 @@
-// ./tests/maelstrom/maelstrom test -w echo --bin target/debug/echo --nodes n1 --time-limit 10
+// tests/maelstrom/maelstrom test -w echo --bin target/debug/echo --nodes n1 --time-limit 10
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,22 +6,34 @@ use minimal_raft_rs::{
     logger::init_logger,
     maelstrom_node::{
         error::RPCError,
-        node::{Handler, Message, Node, Request},
+        node::{Handler, Message, Node},
     },
 };
 
 struct EchoHandler {}
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+enum EchoRequest {
+    Init {
+        node_id: String,
+        node_ids: Vec<String>,
+    },
+    Echo {
+        echo: String,
+    },
+}
+
 #[async_trait]
 impl Handler for EchoHandler {
     async fn handle(&self, node: Node, message: &Message) -> Result<(), RPCError> {
-        let body = serde_json::from_value::<Request>(message.body.clone()).unwrap();
+        let body = serde_json::from_value::<EchoRequest>(message.body.clone()).unwrap();
 
         match body {
-            Request::Init { node_id, node_ids } => {
+            EchoRequest::Init { node_id, node_ids } => {
                 node.init(message, node_id, node_ids).await;
             }
-            Request::Echo { echo } => {
+            EchoRequest::Echo { echo } => {
                 node.reply(
                     message,
                     serde_json::json!({
@@ -30,11 +42,6 @@ impl Handler for EchoHandler {
                     }),
                 )
                 .await
-            }
-            _ => {
-                return Err(RPCError::NotSupported(
-                    "Operation not supported".to_string(),
-                ));
             }
         }
         Ok(())

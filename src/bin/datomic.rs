@@ -1,4 +1,4 @@
-// ./tests/maelstrom/maelstrom test -w txn-list-append --bin target/debug/datomic --time-limit 10 --node-count 2 --rate 100
+// tests/maelstrom/maelstrom test -w txn-list-append --bin target/debug/datomic --time-limit 10 --node-count 2 --rate 100
 use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicU64},
@@ -9,7 +9,7 @@ use minimal_raft_rs::{
     logger::init_logger,
     maelstrom_node::{
         error::RPCError,
-        node::{Handler, Message, Node, Request},
+        node::{Handler, Message, Node},
     },
 };
 use tokio::sync::Mutex;
@@ -20,6 +20,18 @@ const LIN_KV_NODE_ID: &str = "lin-kv";
 struct DatomicHandler {
     thunk_id: AtomicU64,
     thunk_cache: Mutex<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+enum DatomicRequest {
+    Init {
+        node_id: String,
+        node_ids: Vec<String>,
+    },
+    Txn {
+        txn: Vec<Vec<serde_json::Value>>,
+    },
 }
 
 impl DatomicHandler {
@@ -118,13 +130,13 @@ impl DatomicHandler {
 #[async_trait]
 impl Handler for DatomicHandler {
     async fn handle(&self, node: Node, message: &Message) -> Result<(), RPCError> {
-        let body = serde_json::from_value::<Request>(message.body.clone()).unwrap();
+        let body = serde_json::from_value::<DatomicRequest>(message.body.clone()).unwrap();
 
         match body {
-            Request::Init { node_id, node_ids } => {
+            DatomicRequest::Init { node_id, node_ids } => {
                 node.init(message, node_id, node_ids).await;
             }
-            Request::Txn { txn } => {
+            DatomicRequest::Txn { txn } => {
                 let mut result = Vec::new();
 
                 // 元のroot thunkのID
@@ -238,11 +250,6 @@ impl Handler for DatomicHandler {
                 } else {
                     return Err(RPCError::TxnConflict("CAS failed!".to_string()));
                 }
-            }
-            _ => {
-                return Err(RPCError::NotSupported(
-                    "Operation not supported".to_string(),
-                ));
             }
         }
         Ok(())

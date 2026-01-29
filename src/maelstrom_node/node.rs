@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, atomic::AtomicU64},
 };
 
@@ -18,52 +18,6 @@ pub struct Message {
     pub src: String,
     pub dest: String,
     pub body: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-pub enum Request {
-    Init {
-        node_id: String,
-        node_ids: Vec<String>,
-    },
-    Echo {
-        echo: String,
-    },
-    Topology {
-        topology: HashMap<String, Vec<String>>,
-    },
-    Broadcast {
-        message: u64,
-    },
-    Read {},
-    Add {
-        element: Option<i64>,
-        delta: Option<i64>,
-    },
-    Replicate {
-        value: Option<HashSet<i64>>,
-        inc: Option<HashMap<String, i64>>,
-        dec: Option<HashMap<String, i64>>,
-    },
-    Txn {
-        txn: Vec<Vec<serde_json::Value>>,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-pub enum Response {
-    InitOk {},
-    EchoOk {
-        echo: String,
-    },
-    TopologyOk {},
-    BroadcastOk {},
-    ReadOk {
-        messages: Option<Vec<u64>>,
-        values: Option<HashSet<String>>,
-    },
 }
 
 pub enum CallbackSender<T> {

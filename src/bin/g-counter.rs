@@ -1,4 +1,4 @@
-// ./tests/maelstrom/maelstrom test -w pn-counter --bin target/debug/g-counter --time-limit 30 --rate 10 --nemesis partition
+// tests/maelstrom/maelstrom test -w pn-counter --bin target/debug/g-counter --time-limit 30 --rate 10 --nemesis partition
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -7,10 +7,27 @@ use minimal_raft_rs::{
     logger::init_logger,
     maelstrom_node::{
         error::RPCError,
-        node::{Handler, Message, Node, Request},
+        node::{Handler, Message, Node},
     },
 };
 use tokio::sync::Mutex;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+enum GCounterRequest {
+    Init {
+        node_id: String,
+        node_ids: Vec<String>,
+    },
+    Add {
+        delta: i64,
+    },
+    Read {},
+    Replicate {
+        inc: HashMap<String, i64>,
+        dec: HashMap<String, i64>,
+    },
+}
 
 struct GCounterHandler {
     inner: Arc<Mutex<GCounterInner>>,
@@ -52,10 +69,10 @@ impl GCounterInner {
 #[async_trait]
 impl Handler for GCounterHandler {
     async fn handle(&self, node: Node, message: &Message) -> Result<(), RPCError> {
-        let body = serde_json::from_value::<Request>(message.body.clone()).unwrap();
+        let body = serde_json::from_value::<GCounterRequest>(message.body.clone()).unwrap();
 
         match body {
-            Request::Init { node_id, node_ids } => {
+            GCounterRequest::Init { node_id, node_ids } => {
                 self.inner.lock().await.init(&node_ids);
                 node.init(message, node_id, node_ids).await;
 
@@ -82,12 +99,8 @@ impl Handler for GCounterHandler {
                     }
                 });
             }
-            Request::Add {
-                element: _element,
-                delta,
-            } => {
+            GCounterRequest::Add { delta } => {
                 let mut inner = self.inner.lock().await;
-                let delta = delta.unwrap();
                 if delta >= 0 {
                     let counter = inner
                         .inc
@@ -103,7 +116,7 @@ impl Handler for GCounterHandler {
                 }
                 node.reply_ok(message).await;
             }
-            Request::Read {} => {
+            GCounterRequest::Read {} => {
                 let inner = self.inner.lock().await;
                 node.reply(
                     message,
@@ -114,28 +127,19 @@ impl Handler for GCounterHandler {
                 )
                 .await;
             }
-            Request::Replicate {
-                value: _value,
-                inc,
-                dec,
-            } => {
+            GCounterRequest::Replicate { inc, dec } => {
                 let mut inner = self.inner.lock().await;
-                for (k, v) in inc.unwrap() {
+                for (k, v) in inc {
                     if !inner.inc.contains_key(&k) || v > inner.inc.get(&k).cloned().unwrap_or(0) {
                         inner.inc.insert(k, v);
                     }
                 }
-                for (k, v) in dec.unwrap() {
+                for (k, v) in dec {
                     if !inner.dec.contains_key(&k) || v > inner.dec.get(&k).cloned().unwrap_or(0) {
                         inner.dec.insert(k, v);
                     }
                 }
                 node.reply_ok(message).await;
-            }
-            _ => {
-                return Err(RPCError::NotSupported(
-                    "Operation not supported".to_string(),
-                ));
             }
         }
         Ok(())

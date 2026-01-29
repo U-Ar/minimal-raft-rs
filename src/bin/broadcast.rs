@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+// tests/maelstrom/maelstrom test -w broadcast --bin target/debug/broadcast --time-limit 20 --rate 100
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use log::debug;
@@ -6,7 +10,7 @@ use minimal_raft_rs::{
     logger::init_logger,
     maelstrom_node::{
         error::RPCError,
-        node::{Handler, Message, Node, Request},
+        node::{Handler, Message, Node},
     },
 };
 use tokio::sync::Mutex;
@@ -20,16 +24,32 @@ struct BroadcastInner {
     messages: HashSet<u64>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+enum BroadcastRequest {
+    Init {
+        node_id: String,
+        node_ids: Vec<String>,
+    },
+    Topology {
+        topology: HashMap<String, Vec<String>>,
+    },
+    Broadcast {
+        message: u64,
+    },
+    Read {},
+}
+
 #[async_trait]
 impl Handler for BroadcastHandler {
     async fn handle(&self, node: Node, message: &Message) -> Result<(), RPCError> {
-        let body = serde_json::from_value::<Request>(message.body.clone()).unwrap();
+        let body = serde_json::from_value::<BroadcastRequest>(message.body.clone()).unwrap();
 
         match body {
-            Request::Init { node_id, node_ids } => {
+            BroadcastRequest::Init { node_id, node_ids } => {
                 node.init(message, node_id, node_ids).await;
             }
-            Request::Topology { topology } => {
+            BroadcastRequest::Topology { topology } => {
                 let neighbors = topology
                     .get(node.get_node_id())
                     .cloned()
@@ -43,7 +63,7 @@ impl Handler for BroadcastHandler {
                 );
                 node.reply_ok(message).await;
             }
-            Request::Broadcast { message: msg } => {
+            BroadcastRequest::Broadcast { message: msg } => {
                 if message.body.get("msg_id").is_some() {
                     node.reply_ok(message).await;
                 }
@@ -80,7 +100,7 @@ impl Handler for BroadcastHandler {
                     );
                 }
             }
-            Request::Read {} => {
+            BroadcastRequest::Read {} => {
                 let inner = self.inner.lock().await;
                 node.reply(
                     message,
@@ -90,11 +110,6 @@ impl Handler for BroadcastHandler {
                     }),
                 )
                 .await;
-            }
-            _ => {
-                return Err(RPCError::NotSupported(
-                    "Operation not supported".to_string(),
-                ));
             }
         }
         Ok(())

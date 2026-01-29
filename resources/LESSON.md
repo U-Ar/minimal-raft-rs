@@ -59,12 +59,17 @@ pub fn run(&mut self) {
 ## つくろうつよつよRaftロードマップ
 
 - node.rsのリファクタリング
-  - Requestはワークロード依存なのでnode.rsから除き、各ファイルに分配する
+  - (DONE)Requestはワークロード依存なのでnode.rsから除き、各ファイルに分配する
   - (DONE)maelstrom-node mod に移す
   - (DONE)RPCErrorのファイルを分ける
   - (DONE)loggerを別ファイルに移す
   - newとrunを分ける
     - Node::new -> Raft::new(node) -> raft.start -> node.run の順番で実行したいので
-
-
+- node.rsとraft.rsの依存性分離
+  - Transportトレイトを定義してraftはTransportを持つようにする
+  - RaftにTransportを渡して初期化、channelを生成。RaftHandlerにRaftのchannelを渡す。RaftHandlerはreceiveに関するつなぎ
+    - send: Raft自身がTransportに送る
+    - receive: Node -> RaftHandler -> Raftのchannelへ送信 という流れ
+- RaftStateMachineの一般化
+- RaftStorageの一般化
 

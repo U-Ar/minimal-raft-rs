@@ -1,4 +1,4 @@
-// ./tests/maelstrom/maelstrom test -w g-set --bin target/debug/g-set --time-limit 20 --rate 10
+// tests/maelstrom/maelstrom test -w g-set --bin target/debug/g-set --time-limit 20 --rate 10
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -7,10 +7,26 @@ use minimal_raft_rs::{
     logger::init_logger,
     maelstrom_node::{
         error::RPCError,
-        node::{Handler, Message, Node, Request},
+        node::{Handler, Message, Node},
     },
 };
 use tokio::sync::Mutex;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+enum GSetRequest {
+    Init {
+        node_id: String,
+        node_ids: Vec<String>,
+    },
+    Add {
+        element: i64,
+    },
+    Read {},
+    Replicate {
+        value: HashSet<i64>,
+    },
+}
 
 struct GSetHandler {
     inner: Arc<Mutex<GSetInner>>,
@@ -23,10 +39,10 @@ struct GSetInner {
 #[async_trait]
 impl Handler for GSetHandler {
     async fn handle(&self, node: Node, message: &Message) -> Result<(), RPCError> {
-        let body = serde_json::from_value::<Request>(message.body.clone()).unwrap();
+        let body = serde_json::from_value::<GSetRequest>(message.body.clone()).unwrap();
 
         match body {
-            Request::Init { node_id, node_ids } => {
+            GSetRequest::Init { node_id, node_ids } => {
                 node.init(message, node_id, node_ids).await;
                 let (n0, h0) = (node.clone(), self.inner.clone());
                 tokio::spawn(async move {
@@ -50,15 +66,12 @@ impl Handler for GSetHandler {
                     }
                 });
             }
-            Request::Add {
-                element,
-                delta: _delta,
-            } => {
+            GSetRequest::Add { element } => {
                 let mut inner = self.inner.lock().await;
-                inner.elements.insert(element.unwrap());
+                inner.elements.insert(element);
                 node.reply_ok(message).await;
             }
-            Request::Read {} => {
+            GSetRequest::Read {} => {
                 let inner = self.inner.lock().await;
                 node.reply(
                     message,
@@ -69,21 +82,12 @@ impl Handler for GSetHandler {
                 )
                 .await;
             }
-            Request::Replicate {
-                value,
-                inc: _inc,
-                dec: _dec,
-            } => {
+            GSetRequest::Replicate { value } => {
                 let mut inner = self.inner.lock().await;
-                for element in value.unwrap() {
+                for element in value {
                     inner.elements.insert(element);
                 }
                 node.reply_ok(message).await;
-            }
-            _ => {
-                return Err(RPCError::NotSupported(
-                    "Operation not supported".to_string(),
-                ));
             }
         }
         Ok(())

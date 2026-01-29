@@ -1,5 +1,5 @@
-// ./tests/maelstrom/maelstrom test -w lin-kv --bin target/debug/raft --time-limit 10 --rate 10 --node-count 1 --concurrency 2n
-// ./tests/maelstrom/maelstrom test -w lin-kv --bin target/debug/raft --node-count 3 --concurrency 4n --rate 30 --time-limit 60 --nemesis partition --nemesis-interval 10 --test-count 10
+// tests/maelstrom/maelstrom test -w lin-kv --bin target/debug/raft --time-limit 10 --rate 10 --node-count 1 --concurrency 2n
+// tests/maelstrom/maelstrom test -w lin-kv --bin target/debug/raft --node-count 3 --concurrency 4n --rate 30 --time-limit 60 --nemesis partition --nemesis-interval 10 --test-count 10
 
 use std::{
     collections::{HashMap, HashSet},
