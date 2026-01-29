@@ -4,23 +4,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use env_logger::Env;
-use log::debug;
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncBufReadExt,
     sync::{Mutex, OnceCell, mpsc, oneshot},
 };
 
-pub fn init_logger() {
-    let env = if cfg!(debug_assertions) {
-        Env::default().default_filter_or("debug")
-    } else {
-        Env::default().default_filter_or("info")
-    };
-
-    env_logger::Builder::from_env(env).init();
-}
+use crate::maelstrom_node::error::RPCError;
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Message {
@@ -154,7 +145,7 @@ impl Node {
     }
 
     pub async fn init(&self, message: &Message, node_id: String, node_ids: Vec<String>) {
-        eprintln!("Initialized node {}", node_id);
+        info!("Initialized node {}", node_id);
         self.inner.set_membership(node_id, node_ids);
 
         self.reply_ok(message).await;
@@ -273,7 +264,6 @@ impl Node {
     }
 
     pub async fn send(&self, dest: &str, body: serde_json::Value) {
-        // TODO: 出力を専用チャンネルで非同期処理
         let out_message = Message {
             src: self.inner.get_membership().node_id.clone(),
             dest: dest.to_string(),
@@ -282,10 +272,10 @@ impl Node {
         if let Some(print_sender) = self.inner.print_sender.get() {
             let out_json = serde_json::to_value(&out_message).unwrap();
             if let Err(err) = print_sender.send(out_json).await {
-                debug!("Failed to send message to print channel: {}", err);
+                warn!("Failed to send message to print channel: {}", err);
             }
         } else {
-            debug!("Print sender not initialized");
+            warn!("Print sender not initialized");
         }
     }
 
@@ -303,7 +293,7 @@ impl Node {
                 self.send(reply_dest, send_body).await;
             }
             _ => {
-                debug!(
+                warn!(
                     "Reply body to {} must be a JSON object: {:?}",
                     reply_dest, body
                 );
@@ -321,7 +311,7 @@ impl Node {
             )
             .await;
         } else {
-            debug!("Cannot reply_ok: message has no type field");
+            warn!("Cannot reply_ok: message has no type field");
         }
     }
 
@@ -348,7 +338,7 @@ impl Node {
                         ptr.handle(&message).await;
                     }
                     Err(e) => {
-                        debug!("Error parsing JSON: {}", e);
+                        warn!("Error parsing JSON: {}", e);
                     }
                 };
             });
@@ -364,56 +354,5 @@ impl Node {
 impl Default for Node {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[derive(Debug)]
-pub enum RPCError {
-    Timeout(String),
-    NodeNotFound(String),
-    NotSupported(String),
-    TemporarilyUnavailable(String),
-    MalformedRequest(String),
-    Crash(String),
-    Abort(String),
-    KeyDoesNotExist(String),
-    KeyAlreadyExists(String),
-    PreconditionFailed(String),
-    TxnConflict(String),
-}
-
-impl RPCError {
-    pub fn to_json(&self) -> serde_json::Value {
-        match self {
-            RPCError::Timeout(text) => {
-                serde_json::json!({"type": "error", "code": 0, "text": text})
-            }
-            RPCError::NodeNotFound(text) => {
-                serde_json::json!({"type": "error", "code": 1, "text": text})
-            }
-            RPCError::NotSupported(text) => {
-                serde_json::json!({"type": "error", "code": 10, "text": text})
-            }
-            RPCError::TemporarilyUnavailable(text) => {
-                serde_json::json!({"type": "error", "code": 11, "text": text})
-            }
-            RPCError::MalformedRequest(text) => {
-                serde_json::json!({"type": "error", "code": 12, "text": text})
-            }
-            RPCError::Crash(text) => serde_json::json!({"type": "error", "code": 13, "text": text}),
-            RPCError::Abort(text) => serde_json::json!({"type": "error", "code": 14, "text": text}),
-            RPCError::KeyDoesNotExist(text) => {
-                serde_json::json!({"type": "error", "code": 20, "text": text})
-            }
-            RPCError::KeyAlreadyExists(text) => {
-                serde_json::json!({"type": "error", "code": 21, "text": text})
-            }
-            RPCError::PreconditionFailed(text) => {
-                serde_json::json!({"type": "error", "code": 22, "text": text})
-            }
-            RPCError::TxnConflict(text) => {
-                serde_json::json!({"type": "error", "code": 23, "text": text})
-            }
-        }
     }
 }

@@ -3,7 +3,13 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use log::debug;
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError, Request, init_logger};
+use minimal_raft_rs::{
+    logger::init_logger,
+    maelstrom_node::{
+        error::RPCError,
+        node::{Handler, Message, Node, Request},
+    },
+};
 use tokio::sync::Mutex;
 
 struct GSetHandler {

@@ -10,7 +10,13 @@ use std::{
 
 use async_trait::async_trait;
 use log::{debug, info};
-use minimal_raft_rs::node::{Handler, Message, Node, RPCError, init_logger};
+use minimal_raft_rs::{
+    logger::init_logger,
+    maelstrom_node::{
+        error::RPCError,
+        node::{Handler, Message, Node},
+    },
+};
 use rand::{self};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{mpsc, oneshot};
