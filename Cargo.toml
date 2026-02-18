@@ -34,5 +34,5 @@ name = "datomic"
 path = "src/bin/datomic.rs"
 
 [[bin]]
-name = "raft"
-path = "src/bin/raft.rs"
+name = "lin-kv"
+path = "src/bin/lin-kv.rs"
