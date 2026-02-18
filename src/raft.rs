@@ -582,7 +582,7 @@ impl Raft {
                 if next_index > self.log.len() {
                     continue;
                 }
-                if next_index <= self.log.entries.len() || elapsed_time >= self.heartbeat_interval {
+                if next_index <= self.log.entries.len() || elapsed_time >= self.heartbeat_interval || force {
                     replicated = true;
                     debug!("Replicating log #{}+ to {}", next_index, node_id);
                     let rx = self
@@ -868,13 +868,13 @@ impl Raft {
                                 })))
                                 .unwrap();
                         }
-                        return;
+                        continue;
                     }
 
                     self.leader = Some(leader_id.clone());
                     self.reset_election_deadline();
 
-                    if self.log.len() <= *prev_log_index as usize
+                    if self.log.len() < *prev_log_index as usize
                         || (*prev_log_index > 0
                             && self.log[*prev_log_index as usize - 1].term != *prev_log_term)
                     {
@@ -888,7 +888,7 @@ impl Raft {
                                 })))
                                 .unwrap();
                         }
-                        return;
+                        continue;
                     }
 
                     let mut log_insert_index = *prev_log_index as usize;
@@ -951,7 +951,7 @@ impl Raft {
                 }
                 LinKvRequest::ReplicateLog {} => {
                     self.replicate_log(false).await;
-                    return;
+                    continue;
                 }
                 _ => {
                     warn!("Received unknown request type: {:?}", request.request);

@@ -2,3 +2,4 @@
   - `tests/maelstrom/maelstrom test -w lin-kv --bin target/release/raft --node-count 3 --concurrency 4n --rate 30 --time-limit 60 --nemesis partition --nemesis-interval 10`
 - latency-raft-2.png: after improving logic of replicate-log
 - latency-raft-3.png: start to use env_logger
+- latency-raft-4.png: fix log replication bug
