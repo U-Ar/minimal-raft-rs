@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use log::{debug, info};
+use log::{debug, info, warn};
 use minimal_raft_rs::{
     logger::init_logger,
     maelstrom_node::{
@@ -102,7 +102,14 @@ struct RaftRequest {
     pub response_tx: Option<oneshot::Sender<Result<serde_json::Value, RPCError>>>,
 }
 
+struct ClusterConfig {
+    pub node_id: String,
+    pub node_ids: Vec<String>,
+}
+
 struct Raft {
+    config: ClusterConfig,
+
     // ハートビート・タイムアウト
     election_timeout: Duration,         // 選挙タイムアウト
     heartbeat_interval: Duration,       // ハートビート間隔
@@ -145,12 +152,13 @@ struct RaftHandler {
 }
 
 impl Raft {
-    pub fn start(node: Arc<Node>) -> mpsc::Sender<RaftRequest> {
+    pub fn start(config: ClusterConfig, node: Arc<Node>) -> mpsc::Sender<RaftRequest> {
         let (tx0, mut rx0) = mpsc::channel::<RaftRequest>(100);
         let tx1 = tx0.clone();
         info!("Raft instance handling starting...");
         tokio::spawn(async move {
-            let mut raft = Raft::new(node, tx0);
+            let mut raft = Raft::new(config, node, tx0);
+            raft.start_routines().await;
             loop {
                 debug!("Waiting for Raft request...");
                 if let Some(message) = rx0.recv().await {
@@ -166,8 +174,13 @@ impl Raft {
         tx1
     }
 
-    pub fn new(node: Arc<Node>, raft_sender: mpsc::Sender<RaftRequest>) -> Self {
+    pub fn new(
+        config: ClusterConfig,
+        node: Arc<Node>,
+        raft_sender: mpsc::Sender<RaftRequest>,
+    ) -> Self {
         Raft {
+            config,
             election_timeout: Duration::from_secs(2),
             heartbeat_interval: Duration::from_secs(1),
             min_replication_interval: Duration::from_millis(50),
@@ -189,6 +202,52 @@ impl Raft {
             last_applied: 1,
             log: RaftLog::new(),
         }
+    }
+
+    async fn start_routines(&mut self) {
+        let raft_sender = self.raft_sender.clone();
+        let node_id = self.config.node_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(rand::random_range(100..=200))).await;
+                let _ = raft_sender
+                    .send(RaftRequest {
+                        src: node_id.clone(),
+                        request: LinKvRequest::StartElection {},
+                        response_tx: None,
+                    })
+                    .await;
+            }
+        });
+        let raft_sender = self.raft_sender.clone();
+        let node_id = self.config.node_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = raft_sender
+                    .send(RaftRequest {
+                        src: node_id.clone(),
+                        request: LinKvRequest::CheckStepDown {},
+                        response_tx: None,
+                    })
+                    .await;
+            }
+        });
+        let raft_sender = self.raft_sender.clone();
+        let node_id = self.config.node_id.clone();
+        let min_replication_interval = self.min_replication_interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(min_replication_interval).await;
+                let _ = raft_sender
+                    .send(RaftRequest {
+                        src: node_id.clone(),
+                        request: LinKvRequest::ReplicateLog {},
+                        response_tx: None,
+                    })
+                    .await;
+            }
+        });
     }
 
     pub fn get_term(&self) -> u64 {
@@ -280,13 +339,13 @@ impl Raft {
 
     pub fn become_leader(&mut self) {
         self.state = State::Leader;
-        self.leader = Some(self.node.get_node_id().to_string());
+        self.leader = Some(self.config.node_id.clone());
         self.last_replication = Instant::now() - Duration::from_secs(1);
 
         self.next_index.clear();
         self.match_index.clear();
-        for node_id in &self.node.get_membership().node_ids {
-            if node_id != self.node.get_node_id() {
+        for node_id in &self.config.node_ids {
+            if node_id != &self.config.node_id {
                 self.next_index.insert(node_id.clone(), self.last_index());
                 self.match_index.insert(node_id.clone(), 0);
             }
@@ -447,9 +506,9 @@ impl Raft {
 
     fn refresh_election_state(&mut self) {
         self.refresh_cancellation_token();
-        self.voted_for = Some(self.node.get_node_id().to_string());
+        self.voted_for = Some(self.config.node_id.clone());
         self.votes.clear();
-        self.votes.insert(self.node.get_node_id().to_string());
+        self.votes.insert(self.config.node_id.clone());
     }
 
     pub async fn request_votes(&mut self) {
@@ -457,7 +516,7 @@ impl Raft {
         let last_log_term = self.last_term();
 
         let raft_sender = self.raft_sender.clone();
-        let peers = self.node.get_membership().node_ids.len() - 1;
+        let peers = self.config.node_ids.len() - 1;
         let (tx, mut rx) = mpsc::channel::<Message>(peers);
 
         debug!(
@@ -506,7 +565,7 @@ impl Raft {
                     {
                         "type": "request_vote",
                         "term": self.term,
-                        "candidate_id": self.node.get_node_id(),
+                        "candidate_id": self.config.node_id,
                         "last_log_index": last_log_index,
                         "last_log_term": last_log_term,
                     }
@@ -522,8 +581,8 @@ impl Raft {
 
         if self.is_leader() && (elapsed_time >= self.min_replication_interval || force) {
             debug!("Replication interval reached, replicating logs to followers");
-            for node_id in self.node.get_membership().node_ids.iter() {
-                if node_id == self.node.get_node_id() {
+            for node_id in self.config.node_ids.iter() {
+                if node_id == &self.config.node_id {
                     continue;
                 }
 
@@ -541,7 +600,7 @@ impl Raft {
                             serde_json::json!({
                                 "type": "append_entries",
                                 "term": self.term,
-                                "leader_id": self.node.get_node_id(),
+                                "leader_id": self.config.node_id,
                                 "prev_log_index": next_index - 1 ,
                                 "prev_log_term": self.log[next_index - 1].term,
                                 "entries": self.log.entries[next_index - 1..], // entries,
@@ -582,57 +641,6 @@ impl Raft {
         for request in requests {
             let response_sender = request.response_tx;
             match &request.request {
-                LinKvRequest::Init {
-                    node_id: _node_id,
-                    node_ids: _node_ids,
-                } => {
-                    let raft_sender = self.raft_sender.clone();
-                    let src = request.src.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(rand::random_range(
-                                100..=200,
-                            )))
-                            .await;
-                            let _ = raft_sender
-                                .send(RaftRequest {
-                                    src: src.clone(),
-                                    request: LinKvRequest::StartElection {},
-                                    response_tx: None,
-                                })
-                                .await;
-                        }
-                    });
-                    let raft_sender = self.raft_sender.clone();
-                    let src = request.src.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            let _ = raft_sender
-                                .send(RaftRequest {
-                                    src: src.clone(),
-                                    request: LinKvRequest::CheckStepDown {},
-                                    response_tx: None,
-                                })
-                                .await;
-                        }
-                    });
-                    let raft_sender = self.raft_sender.clone();
-                    let src = request.src.clone();
-                    let min_replication_interval = self.min_replication_interval;
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(min_replication_interval).await;
-                            let _ = raft_sender
-                                .send(RaftRequest {
-                                    src: src.clone(),
-                                    request: LinKvRequest::ReplicateLog {},
-                                    response_tx: None,
-                                })
-                                .await;
-                        }
-                    });
-                }
                 LinKvRequest::Read {
                     origin: _origin,
                     msg_id,
@@ -825,7 +833,7 @@ impl Raft {
                     if self.is_candidate() && self.term == *term && *vote_granted {
                         debug!("Received vote from {}", request.src);
                         self.votes.insert(request.src);
-                        if self.votes.len() >= majority(self.node.get_membership().node_ids.len()) {
+                        if self.votes.len() >= majority(self.config.node_ids.len()) {
                             debug!("Becoming leader for term {}", self.term);
                             self.become_leader();
                         }
@@ -953,6 +961,9 @@ impl Raft {
                     self.replicate_log(false).await;
                     return;
                 }
+                _ => {
+                    warn!("Received unknown request type: {:?}", request.request);
+                }
             }
         }
         self.replicate_log(force_replicate).await;
@@ -1075,19 +1086,15 @@ impl Handler for RaftHandler {
                 node.init(message, node_id.clone(), node_ids.clone()).await;
                 debug!("Initialized node. starting Raft instance...");
                 self.raft_sender
-                    .set(Raft::start(Arc::new(node.clone())))
+                    .set(Raft::start(
+                        ClusterConfig {
+                            node_id: node_id.clone(),
+                            node_ids: node_ids.clone(),
+                        },
+                        Arc::new(node.clone()),
+                    ))
                     .unwrap_or_default();
                 debug!("Raft instance started.");
-                let _ = self
-                    .raft_sender
-                    .get()
-                    .unwrap()
-                    .send(RaftRequest {
-                        src: message.src.clone(),
-                        request: body,
-                        response_tx: None,
-                    })
-                    .await;
             }
             LinKvRequest::Read {
                 origin,
