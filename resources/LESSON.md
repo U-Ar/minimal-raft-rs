@@ -63,13 +63,21 @@ pub fn run(&mut self) {
   - (DONE)maelstrom-node mod に移す
   - (DONE)RPCErrorのファイルを分ける
   - (DONE)loggerを別ファイルに移す
-  - newとrunを分ける
-    - Node::new -> Raft::new(node) -> raft.start -> node.run の順番で実行したいので
+  - (DONE)newとrunを分ける
+    - (DONE)Node::new -> Raft::new(node) -> raft.start -> node.run の順番で実行したいので
+    - (DONE)各mainをtokio::mainにする
+  - Initのやり方を変える
+    - ふつうはRaft::startの時にクラスタコンフィグを与えて開始したいはず
+    - Raft::startしてhandle_requestで非同期的にinitを受け取るんじゃなくて、initメッセージの処理はRaftHandlerの側で行う。クラスタコンフィグを受け取ったらそれを与えてRaftインスタンスを開始する
 - node.rsとraft.rsの依存性分離
   - Transportトレイトを定義してraftはTransportを持つようにする
   - RaftにTransportを渡して初期化、channelを生成。RaftHandlerにRaftのchannelを渡す。RaftHandlerはreceiveに関するつなぎ
     - send: Raft自身がTransportに送る
     - receive: Node -> RaftHandler -> Raftのchannelへ送信 という流れ
+- RaftHandlerとRaftを分離する。LinKvRequestとRaftRequestを別にする
 - RaftStateMachineの一般化
+  - まずは既存のものをHashMapStateMachineにする
+    - ログのコマンドはRaft本体では関知しないようにする(Vecu8にする)
 - RaftStorageの一般化
+- read index最適化を入れる
 

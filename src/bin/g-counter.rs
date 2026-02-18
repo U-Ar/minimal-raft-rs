@@ -154,9 +154,10 @@ impl GCounterHandler {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(GCounterHandler::new()));
-    node.run();
+    node.serve().await;
 }

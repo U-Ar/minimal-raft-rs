@@ -298,11 +298,6 @@ impl Node {
             });
         }
     }
-
-    pub fn run(self: Arc<Self>) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(self.serve());
-    }
 }
 
 impl Default for Node {

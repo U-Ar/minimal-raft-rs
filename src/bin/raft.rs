@@ -113,7 +113,7 @@ struct Raft {
     last_replication: Instant,   // 最後のログ複製時刻
 
     // 入出力
-    node: Node,
+    node: Arc<Node>,
     raft_sender: mpsc::Sender<RaftRequest>,
 
     // 選挙状態
@@ -131,7 +131,6 @@ struct Raft {
 
     state_machine: HashMap<String, RaftValue>,
     last_applied: usize,
-
     log: RaftLog,
 }
 
@@ -146,7 +145,7 @@ struct RaftHandler {
 }
 
 impl Raft {
-    pub fn start(node: Node) -> mpsc::Sender<RaftRequest> {
+    pub fn start(node: Arc<Node>) -> mpsc::Sender<RaftRequest> {
         let (tx0, mut rx0) = mpsc::channel::<RaftRequest>(100);
         let tx1 = tx0.clone();
         info!("Raft instance handling starting...");
@@ -156,14 +155,18 @@ impl Raft {
                 debug!("Waiting for Raft request...");
                 if let Some(message) = rx0.recv().await {
                     debug!("Received Raft request");
-                    let _ = raft.handle_request(message).await;
+                    let mut requests = vec![message];
+                    while let Ok(message) = rx0.try_recv() {
+                        requests.push(message);
+                    }
+                    let _ = raft.handle_request(requests).await;
                 }
             }
         });
         tx1
     }
 
-    pub fn new(node: Node, raft_sender: mpsc::Sender<RaftRequest>) -> Self {
+    pub fn new(node: Arc<Node>, raft_sender: mpsc::Sender<RaftRequest>) -> Self {
         Raft {
             election_timeout: Duration::from_secs(2),
             heartbeat_interval: Duration::from_secs(1),
@@ -270,6 +273,7 @@ impl Raft {
         self.match_index.clear();
 
         self.reset_election_deadline();
+
         self.cancel_election();
         debug!("Became follower for term {}", self.term);
     }
@@ -466,8 +470,7 @@ impl Raft {
         tokio::spawn(async move {
             let mut received = 0;
             while received < peers {
-                #[cfg(debug_assertions)]
-                eprintln!("Waiting for vote responses...");
+                debug!("Waiting for vote responses...");
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         break;
@@ -475,8 +478,7 @@ impl Raft {
                     message = rx.recv() => {
                         match message {
                             Some(message) => {
-                                #[cfg(debug_assertions)]
-                                eprintln!("Received vote response from {}", message.src);
+                                debug!("Received vote response from {}", message.src);
                                 received += 1;
                                 let res = serde_json::from_value::<LinKvRequest>(message.body);
                                 if let Ok(res) = res {
@@ -488,16 +490,14 @@ impl Raft {
                                 }
                             }
                             None => {
-                                #[cfg(debug_assertions)]
-                                eprintln!("Vote response channel closed");
+                                debug!("Vote response channel closed");
                                 break;
                             }
                         }
                     }
                 }
             }
-            #[cfg(debug_assertions)]
-            eprintln!("Finished processing vote responses.");
+            debug!("Finished processing vote responses.");
         });
 
         self.node
@@ -577,378 +577,382 @@ impl Raft {
         }
     }
 
-    pub async fn handle_request(&mut self, request: RaftRequest) {
-        let response_sender = request.response_tx;
+    pub async fn handle_request(&mut self, requests: Vec<RaftRequest>) {
         let mut force_replicate = false;
-        match &request.request {
-            LinKvRequest::Init {
-                node_id: _node_id,
-                node_ids: _node_ids,
-            } => {
-                let raft_sender = self.raft_sender.clone();
-                let src = request.src.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(rand::random_range(100..=200)))
+        for request in requests {
+            let response_sender = request.response_tx;
+            match &request.request {
+                LinKvRequest::Init {
+                    node_id: _node_id,
+                    node_ids: _node_ids,
+                } => {
+                    let raft_sender = self.raft_sender.clone();
+                    let src = request.src.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(rand::random_range(
+                                100..=200,
+                            )))
                             .await;
-                        let _ = raft_sender
-                            .send(RaftRequest {
-                                src: src.clone(),
-                                request: LinKvRequest::StartElection {},
-                                response_tx: None,
-                            })
-                            .await;
-                    }
-                });
-                let raft_sender = self.raft_sender.clone();
-                let src = request.src.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        let _ = raft_sender
-                            .send(RaftRequest {
-                                src: src.clone(),
-                                request: LinKvRequest::CheckStepDown {},
-                                response_tx: None,
-                            })
-                            .await;
-                    }
-                });
-                let raft_sender = self.raft_sender.clone();
-                let src = request.src.clone();
-                let min_replication_interval = self.min_replication_interval;
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(min_replication_interval).await;
-                        let _ = raft_sender
-                            .send(RaftRequest {
-                                src: src.clone(),
-                                request: LinKvRequest::ReplicateLog {},
-                                response_tx: None,
-                            })
-                            .await;
-                    }
-                });
-            }
-            LinKvRequest::Read {
-                origin: _origin,
-                msg_id,
-                key,
-            } => {
-                debug!("Received read request from {} for key {}", request.src, key);
-                if self.is_leader() {
-                    self.log.append(RaftLogEntry {
-                        term: self.get_term(),
-                        src: request.src.clone(),
-                        op: request.request.clone(),
+                            let _ = raft_sender
+                                .send(RaftRequest {
+                                    src: src.clone(),
+                                    request: LinKvRequest::StartElection {},
+                                    response_tx: None,
+                                })
+                                .await;
+                        }
                     });
-                    force_replicate = true;
-                } else if let Some(leader) = &self.leader {
-                    self.node
-                        .send(
-                            leader,
-                            serde_json::json!({
-                                "type": "read",
-                                "msg_id": msg_id,
-                                "key": key,
-                                "origin": request.src.clone(),
-                            }),
-                        )
-                        .await;
-                } else {
-                    self.node
-                        .send(
-                            request.src.as_str(),
-                            serde_json::json!({
-                                "type": "error",
-                                "in_reply_to": msg_id,
-                                "code": 11,
-                                "text": "No leader elected.",
-                            }),
-                        )
-                        .await;
-                }
-            }
-            LinKvRequest::Write {
-                origin: _origin,
-                msg_id,
-                key,
-                value,
-            } => {
-                if self.is_leader() {
-                    force_replicate = true;
-                    debug!(
-                        "Received write request from {} for key {}, value {}",
-                        request.src, key, value
-                    );
-                    self.log.append(RaftLogEntry {
-                        term: self.get_term(),
-                        src: request.src.clone(),
-                        op: request.request.clone(),
+                    let raft_sender = self.raft_sender.clone();
+                    let src = request.src.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            let _ = raft_sender
+                                .send(RaftRequest {
+                                    src: src.clone(),
+                                    request: LinKvRequest::CheckStepDown {},
+                                    response_tx: None,
+                                })
+                                .await;
+                        }
                     });
-                } else if let Some(leader) = &self.leader {
-                    self.node
-                        .send(
-                            leader,
-                            serde_json::json!({
-                                "type": "write",
-                                "key": key,
-                                "value": value,
-                                "msg_id": msg_id,
-                                "origin": request.src.clone(),
-                            }),
-                        )
-                        .await;
-                } else {
-                    self.node
-                        .send(
-                            request.src.as_str(),
-                            serde_json::json!({
-                                "type": "error",
-                                "in_reply_to": msg_id,
-                                "code": 11,
-                                "text": "No leader elected.",
-                            }),
-                        )
-                        .await;
-                }
-            }
-            LinKvRequest::Cas {
-                origin: _origin,
-                msg_id,
-                key,
-                from,
-                to,
-            } => {
-                if self.is_leader() {
-                    force_replicate = true;
-                    debug!(
-                        "Received cas request from {} for key {}, from {}, to {}",
-                        request.src, key, from, to
-                    );
-                    self.log.append(RaftLogEntry {
-                        term: self.get_term(),
-                        src: request.src.clone(),
-                        op: request.request.clone(),
+                    let raft_sender = self.raft_sender.clone();
+                    let src = request.src.clone();
+                    let min_replication_interval = self.min_replication_interval;
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(min_replication_interval).await;
+                            let _ = raft_sender
+                                .send(RaftRequest {
+                                    src: src.clone(),
+                                    request: LinKvRequest::ReplicateLog {},
+                                    response_tx: None,
+                                })
+                                .await;
+                        }
                     });
-                } else if let Some(leader) = &self.leader {
-                    self.node
-                        .send(
-                            leader,
-                            serde_json::json!({
-                                "type": "cas",
-                                "key": key,
-                                "from": from,
-                                "to": to,
-                                "msg_id": msg_id,
-                                "origin": request.src.clone(),
-                            }),
-                        )
-                        .await;
-                } else {
-                    self.node
-                        .send(
-                            request.src.as_str(),
-                            serde_json::json!({
-                                "type": "error",
-                                "in_reply_to": msg_id,
-                                "code": 11,
-                                "text": "No leader elected.",
-                            }),
-                        )
-                        .await;
                 }
-            }
-            LinKvRequest::RequestVote {
-                term,
-                candidate_id,
-                last_log_index,
-                last_log_term,
-            } => {
-                debug!(
-                    "Received vote request from {} for term {}",
-                    candidate_id, term
-                );
-                self.maybe_step_down(*term);
-
-                let mut vote_granted = false;
-                if *term < self.get_term() {
-                    debug!(
-                        "Candidate term {} is less than current term {}",
-                        term,
-                        self.get_term()
-                    );
-                } else if self.is_voted() && self.get_voted_for() != *candidate_id {
-                    debug!("Already voted for {}", self.get_voted_for());
-                } else if !self
-                    .is_candidate_log_up_to_date(*last_log_index as usize, *last_log_term)
-                {
-                    debug!(
-                        "Our logs are both at term {}, but candidate's log is not up-to-date",
-                        last_log_term
-                    );
-                } else {
-                    debug!("Voted for candidate {}", candidate_id);
-                    vote_granted = true;
-                    self.set_voted_for(candidate_id.clone());
-                    self.reset_election_deadline();
-                }
-
-                if let Some(sender) = response_sender {
-                    sender
-                        .send(Ok(serde_json::json!({
-                            "type": "request_vote_res",
-                            "term": self.get_term(),
-                            "vote_granted": vote_granted,
-                        })))
-                        .unwrap();
-                }
-            }
-            LinKvRequest::StartElection {} => {
-                debug!("Received periodic election check");
-                if self.passed_election_deadline() {
-                    debug!("Election deadline passed, starting election");
+                LinKvRequest::Read {
+                    origin: _origin,
+                    msg_id,
+                    key,
+                } => {
+                    debug!("Received read request from {} for key {}", request.src, key);
                     if self.is_leader() {
+                        self.log.append(RaftLogEntry {
+                            term: self.get_term(),
+                            src: request.src.clone(),
+                            op: request.request.clone(),
+                        });
+                        force_replicate = true;
+                    } else if let Some(leader) = &self.leader {
+                        self.node
+                            .send(
+                                leader,
+                                serde_json::json!({
+                                    "type": "read",
+                                    "msg_id": msg_id,
+                                    "key": key,
+                                    "origin": request.src.clone(),
+                                }),
+                            )
+                            .await;
+                    } else {
+                        self.node
+                            .send(
+                                request.src.as_str(),
+                                serde_json::json!({
+                                    "type": "error",
+                                    "in_reply_to": msg_id,
+                                    "code": 11,
+                                    "text": "No leader elected.",
+                                }),
+                            )
+                            .await;
+                    }
+                }
+                LinKvRequest::Write {
+                    origin: _origin,
+                    msg_id,
+                    key,
+                    value,
+                } => {
+                    if self.is_leader() {
+                        force_replicate = true;
+                        debug!(
+                            "Received write request from {} for key {}, value {}",
+                            request.src, key, value
+                        );
+                        self.log.append(RaftLogEntry {
+                            term: self.get_term(),
+                            src: request.src.clone(),
+                            op: request.request.clone(),
+                        });
+                    } else if let Some(leader) = &self.leader {
+                        self.node
+                            .send(
+                                leader,
+                                serde_json::json!({
+                                    "type": "write",
+                                    "key": key,
+                                    "value": value,
+                                    "msg_id": msg_id,
+                                    "origin": request.src.clone(),
+                                }),
+                            )
+                            .await;
+                    } else {
+                        self.node
+                            .send(
+                                request.src.as_str(),
+                                serde_json::json!({
+                                    "type": "error",
+                                    "in_reply_to": msg_id,
+                                    "code": 11,
+                                    "text": "No leader elected.",
+                                }),
+                            )
+                            .await;
+                    }
+                }
+                LinKvRequest::Cas {
+                    origin: _origin,
+                    msg_id,
+                    key,
+                    from,
+                    to,
+                } => {
+                    if self.is_leader() {
+                        force_replicate = true;
+                        debug!(
+                            "Received cas request from {} for key {}, from {}, to {}",
+                            request.src, key, from, to
+                        );
+                        self.log.append(RaftLogEntry {
+                            term: self.get_term(),
+                            src: request.src.clone(),
+                            op: request.request.clone(),
+                        });
+                    } else if let Some(leader) = &self.leader {
+                        self.node
+                            .send(
+                                leader,
+                                serde_json::json!({
+                                    "type": "cas",
+                                    "key": key,
+                                    "from": from,
+                                    "to": to,
+                                    "msg_id": msg_id,
+                                    "origin": request.src.clone(),
+                                }),
+                            )
+                            .await;
+                    } else {
+                        self.node
+                            .send(
+                                request.src.as_str(),
+                                serde_json::json!({
+                                    "type": "error",
+                                    "in_reply_to": msg_id,
+                                    "code": 11,
+                                    "text": "No leader elected.",
+                                }),
+                            )
+                            .await;
+                    }
+                }
+                LinKvRequest::RequestVote {
+                    term,
+                    candidate_id,
+                    last_log_index,
+                    last_log_term,
+                } => {
+                    debug!(
+                        "Received vote request from {} for term {}",
+                        candidate_id, term
+                    );
+                    self.maybe_step_down(*term);
+
+                    let mut vote_granted = false;
+                    if *term < self.get_term() {
+                        debug!(
+                            "Candidate term {} is less than current term {}",
+                            term,
+                            self.get_term()
+                        );
+                    } else if self.is_voted() && self.get_voted_for() != *candidate_id {
+                        debug!("Already voted for {}", self.get_voted_for());
+                    } else if !self
+                        .is_candidate_log_up_to_date(*last_log_index as usize, *last_log_term)
+                    {
+                        debug!(
+                            "Our logs are both at term {}, but candidate's log is not up-to-date",
+                            last_log_term
+                        );
+                    } else {
+                        debug!("Voted for candidate {}", candidate_id);
+                        vote_granted = true;
+                        self.set_voted_for(candidate_id.clone());
                         self.reset_election_deadline();
-                    } else {
-                        self.become_candidate().await;
                     }
-                }
-            }
-            LinKvRequest::RequestVoteRes { term, vote_granted } => {
-                debug!("Received vote response for term {}: {}", term, vote_granted);
-                self.reset_step_down_deadline();
-                self.maybe_step_down(*term);
-                if self.is_candidate() && self.term == *term && *vote_granted {
-                    debug!("Received vote from {}", request.src);
-                    self.votes.insert(request.src);
-                    if self.votes.len() >= majority(self.node.get_membership().node_ids.len()) {
-                        debug!("Becoming leader for term {}", self.term);
-                        self.become_leader();
-                    }
-                }
-            }
-            LinKvRequest::CheckStepDown {} => {
-                if self.is_leader() && Instant::now() >= self.step_down_deadline {
-                    debug!("Stepping down: haven't received acks from followers recently");
-                    self.become_follower();
-                }
-            }
-            LinKvRequest::AppendEntries {
-                term,
-                leader_id,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit,
-            } => {
-                debug!(
-                    "Received append entries from leader {} for term {}, prev_log_index {}, prev_log_term {}, leader_commit {}",
-                    leader_id, term, prev_log_index, prev_log_term, leader_commit
-                );
-                debug!(
-                    "Current term {}, log length {}",
-                    self.get_term(),
-                    self.log.len()
-                );
 
-                self.maybe_step_down(*term);
-
-                if *term < self.get_term() {
-                    if let Some(response_sender) = response_sender {
-                        response_sender
+                    if let Some(sender) = response_sender {
+                        sender
                             .send(Ok(serde_json::json!({
-                                "type": "append_entries_res",
+                                "type": "request_vote_res",
                                 "term": self.get_term(),
-                                "success": false,
-                                "next_index": 0,
+                                "vote_granted": vote_granted,
                             })))
                             .unwrap();
                     }
-                    return;
                 }
-
-                self.leader = Some(leader_id.clone());
-                self.reset_election_deadline();
-
-                if self.log.len() <= *prev_log_index as usize
-                    || (*prev_log_index > 0
-                        && self.log[*prev_log_index as usize - 1].term != *prev_log_term)
-                {
-                    if let Some(response_sender) = response_sender {
-                        response_sender
-                            .send(Ok(serde_json::json!({
-                                "type": "append_entries_res",
-                                "term": self.get_term(),
-                                "success": false,
-                                "next_index": 1,
-                            })))
-                            .unwrap();
+                LinKvRequest::StartElection {} => {
+                    debug!("Received periodic election check");
+                    if self.passed_election_deadline() {
+                        debug!("Election deadline passed, starting election");
+                        if self.is_leader() {
+                            self.reset_election_deadline();
+                        } else {
+                            self.become_candidate().await;
+                        }
                     }
-                    return;
                 }
-
-                let mut log_insert_index = *prev_log_index as usize;
-                for entry in entries {
-                    if log_insert_index >= self.log.len() {
-                        self.log.append(entry.clone());
-                    } else if self.log[log_insert_index].term != entry.term {
-                        self.log.truncate(log_insert_index);
-                        self.log.append(entry.clone());
-                    }
-                    log_insert_index += 1;
-                }
-
-                if *leader_commit as usize > self.commit_index {
-                    self.commit_index = std::cmp::min(*leader_commit as usize, self.log.len());
-                    self.advance_state_machine().await;
-                }
-
-                if let Some(response_sender) = response_sender {
-                    response_sender
-                        .send(Ok(serde_json::json!({
-                                "type": "append_entries_res",
-                                "term": self.get_term(),
-                                "success": true,
-                                "next_index": self.log.len() + 1,
-                        })))
-                        .unwrap();
-                }
-            }
-            LinKvRequest::AppendEntriesRes {
-                term,
-                success,
-                next_index,
-            } => {
-                debug!(
-                    "Received append entries response for term {}: success={}, next_index {}",
-                    term, success, next_index
-                );
-                self.maybe_step_down(*term);
-                if self.is_leader() && self.term == *term {
+                LinKvRequest::RequestVoteRes { term, vote_granted } => {
+                    debug!("Received vote response for term {}: {}", term, vote_granted);
                     self.reset_step_down_deadline();
-                    if *success {
-                        self.next_index
-                            .entry(request.src.clone())
-                            .and_modify(|index| {
-                                *index = *next_index as usize;
-                            });
-                        self.match_index.entry(request.src).and_modify(|index| {
-                            *index = *next_index as usize - 1;
-                        });
-                        self.advance_commit_index().await;
-                    } else {
-                        self.next_index.entry(request.src).and_modify(|index| {
-                            if *index > 0 {
-                                *index -= 1;
-                            }
-                        });
+                    self.maybe_step_down(*term);
+                    if self.is_candidate() && self.term == *term && *vote_granted {
+                        debug!("Received vote from {}", request.src);
+                        self.votes.insert(request.src);
+                        if self.votes.len() >= majority(self.node.get_membership().node_ids.len()) {
+                            debug!("Becoming leader for term {}", self.term);
+                            self.become_leader();
+                        }
                     }
                 }
-            }
-            LinKvRequest::ReplicateLog {} => {
-                self.replicate_log(false).await;
-                return;
+                LinKvRequest::CheckStepDown {} => {
+                    if self.is_leader() && Instant::now() >= self.step_down_deadline {
+                        debug!("Stepping down: haven't received acks from followers recently");
+                        self.become_follower();
+                    }
+                }
+                LinKvRequest::AppendEntries {
+                    term,
+                    leader_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                } => {
+                    debug!(
+                        "Received append entries from leader {} for term {}, prev_log_index {}, prev_log_term {}, leader_commit {}",
+                        leader_id, term, prev_log_index, prev_log_term, leader_commit
+                    );
+                    debug!(
+                        "Current term {}, log length {}",
+                        self.get_term(),
+                        self.log.len()
+                    );
+
+                    self.maybe_step_down(*term);
+
+                    if *term < self.get_term() {
+                        if let Some(response_sender) = response_sender {
+                            response_sender
+                                .send(Ok(serde_json::json!({
+                                    "type": "append_entries_res",
+                                    "term": self.get_term(),
+                                    "success": false,
+                                    "next_index": 0,
+                                })))
+                                .unwrap();
+                        }
+                        return;
+                    }
+
+                    self.leader = Some(leader_id.clone());
+                    self.reset_election_deadline();
+
+                    if self.log.len() <= *prev_log_index as usize
+                        || (*prev_log_index > 0
+                            && self.log[*prev_log_index as usize - 1].term != *prev_log_term)
+                    {
+                        if let Some(response_sender) = response_sender {
+                            response_sender
+                                .send(Ok(serde_json::json!({
+                                    "type": "append_entries_res",
+                                    "term": self.get_term(),
+                                    "success": false,
+                                    "next_index": 1,
+                                })))
+                                .unwrap();
+                        }
+                        return;
+                    }
+
+                    let mut log_insert_index = *prev_log_index as usize;
+                    for entry in entries {
+                        if log_insert_index >= self.log.len() {
+                            self.log.append(entry.clone());
+                        } else if self.log[log_insert_index].term != entry.term {
+                            self.log.truncate(log_insert_index);
+                            self.log.append(entry.clone());
+                        }
+                        log_insert_index += 1;
+                    }
+
+                    if *leader_commit as usize > self.commit_index {
+                        self.commit_index = std::cmp::min(*leader_commit as usize, self.log.len());
+                        self.advance_state_machine().await;
+                    }
+
+                    if let Some(response_sender) = response_sender {
+                        response_sender
+                            .send(Ok(serde_json::json!({
+                                    "type": "append_entries_res",
+                                    "term": self.get_term(),
+                                    "success": true,
+                                    "next_index": self.log.len() + 1,
+                            })))
+                            .unwrap();
+                    }
+                }
+                LinKvRequest::AppendEntriesRes {
+                    term,
+                    success,
+                    next_index,
+                } => {
+                    debug!(
+                        "Received append entries response for term {}: success={}, next_index {}",
+                        term, success, next_index
+                    );
+                    self.maybe_step_down(*term);
+                    if self.is_leader() && self.term == *term {
+                        self.reset_step_down_deadline();
+                        if *success {
+                            self.next_index
+                                .entry(request.src.clone())
+                                .and_modify(|index| {
+                                    *index = *next_index as usize;
+                                });
+                            self.match_index.entry(request.src).and_modify(|index| {
+                                *index = *next_index as usize - 1;
+                            });
+                            self.advance_commit_index().await;
+                        } else {
+                            self.next_index.entry(request.src).and_modify(|index| {
+                                if *index > 0 {
+                                    *index -= 1;
+                                }
+                            });
+                        }
+                    }
+                }
+                LinKvRequest::ReplicateLog {} => {
+                    self.replicate_log(false).await;
+                    return;
+                }
             }
         }
         self.replicate_log(force_replicate).await;
@@ -1071,7 +1075,7 @@ impl Handler for RaftHandler {
                 node.init(message, node_id.clone(), node_ids.clone()).await;
                 debug!("Initialized node. starting Raft instance...");
                 self.raft_sender
-                    .set(Raft::start(node.clone()))
+                    .set(Raft::start(Arc::new(node.clone())))
                     .unwrap_or_default();
                 debug!("Raft instance started.");
                 let _ = self
@@ -1189,9 +1193,10 @@ impl Handler for RaftHandler {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(RaftHandler::new()));
-    node.run();
+    node.serve().await;
 }

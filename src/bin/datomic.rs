@@ -256,10 +256,11 @@ impl Handler for DatomicHandler {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     init_logger();
     let node = Arc::new(Node::new());
     let handler = Arc::new(DatomicHandler::new());
     node.set_handler(handler);
-    node.run();
+    node.serve().await;
 }

@@ -48,9 +48,10 @@ impl Handler for EchoHandler {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     init_logger();
     let node = Arc::new(Node::new());
     node.set_handler(Arc::new(EchoHandler {}));
-    node.run();
+    node.serve().await;
 }
