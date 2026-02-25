@@ -1,35 +1,36 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::{Index, IndexMut},
     sync::Arc,
     time::Duration,
 };
 
+use async_trait::async_trait;
 use log::{debug, info, warn};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     time::Instant,
 };
-use tokio_util::sync::CancellationToken;
 
-use crate::maelstrom_node::{
-    error::RPCError,
-    node::{Message, Node},
-};
+#[async_trait]
+pub trait StateMachine: Sync + Send {
+    async fn apply(&mut self, command: Vec<u8>) -> Result<Vec<u8>, RaftError>;
+}
 
-type RaftValue = serde_json::Value;
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TransportError {
+    pub message: String,
+}
 
-fn number_or_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let v = serde_json::Value::deserialize(deserializer)?;
-    match v {
-        serde_json::Value::Number(n) => Ok(n.to_string()),
-        serde_json::Value::String(s) => Ok(s),
-        _ => Err(serde::de::Error::custom("expected number or string")),
-    }
+#[async_trait]
+pub trait Transport: Sync + Send {
+    async fn send(&self, target: &str, message: RaftMessage) -> Result<(), TransportError>;
+    async fn broadcast(
+        &self,
+        targets: &[String],
+        message: RaftMessage,
+    ) -> Result<(), TransportError>;
 }
 
 fn majority(count: usize) -> usize {
@@ -38,64 +39,86 @@ fn majority(count: usize) -> usize {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case", tag = "type")]
-pub enum LinKvRequest {
-    Init {
-        node_id: String,
-        node_ids: Vec<String>,
-    },
-    Read {
-        origin: Option<String>,
-        msg_id: u64,
-        #[serde(deserialize_with = "number_or_string")]
-        key: String,
-    },
-    Write {
-        origin: Option<String>,
-        msg_id: u64,
-        #[serde(deserialize_with = "number_or_string")]
-        key: String,
-        value: RaftValue,
-    },
-    Cas {
-        origin: Option<String>,
-        msg_id: u64,
-        #[serde(deserialize_with = "number_or_string")]
-        key: String,
-        from: RaftValue,
-        to: RaftValue,
-    },
+pub enum RaftError {
+    Timeout(String),
+    NodeNotFound(String),
+    NotSupported(String),
+    NoLeader(String),
+    MalformedRequest(String),
+    Crash(String),
+    Abort(String),
+    KeyDoesNotExist(String),
+    KeyAlreadyExists(String),
+    PreconditionFailed(String),
+    Redirect { leader_id: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum RaftMessage {
+    Internal(InternalMessage),
+    RPC(RPCMessage),
+    Client(ClientRequest),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum InternalMessage {
+    StartElection,
+    CheckStepDown,
+    ReplicateLog,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum RPCMessage {
     RequestVote {
         term: u64,
         candidate_id: String,
-        last_log_index: u64,
+        last_log_index: usize,
         last_log_term: u64,
     },
-    StartElection {},
     RequestVoteRes {
         term: u64,
         vote_granted: bool,
     },
-    CheckStepDown {},
     AppendEntries {
         term: u64,
         leader_id: String,
-        prev_log_index: u64,
+        prev_log_index: usize,
         prev_log_term: u64,
         entries: Vec<RaftLogEntry>,
-        leader_commit: u64,
+        leader_commit: usize,
     },
     AppendEntriesRes {
         term: u64,
         success: bool,
-        next_index: u64,
+        next_index: usize,
     },
-    ReplicateLog {},
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ClientRequest {
+    Command { op: Vec<u8> },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum RaftResponse {
+    RPC(RPCMessage),
+    Client { result: Vec<u8> },
 }
 
 pub struct RaftRequest {
     pub src: String,
-    pub request: LinKvRequest,
-    pub response_tx: Option<oneshot::Sender<Result<serde_json::Value, RPCError>>>,
+    pub request: RaftMessage,
+    pub response_tx: Option<oneshot::Sender<Result<RaftResponse, RaftError>>>,
+}
+
+struct PendingRequest {
+    log_index: usize,
+    response_tx: oneshot::Sender<Result<RaftResponse, RaftError>>,
 }
 
 pub struct ClusterConfig {
@@ -116,7 +139,7 @@ pub struct Raft {
     last_replication: Instant,   // 最後のログ複製時刻
 
     // 入出力
-    node: Arc<Node>,
+    transport: Arc<dyn Transport + Send + Sync>,
     raft_sender: mpsc::Sender<RaftRequest>,
 
     // 選挙状態
@@ -124,7 +147,6 @@ pub struct Raft {
     term: u64,
     voted_for: Option<String>,
     votes: HashSet<String>,
-    cancellation_token: CancellationToken,
 
     // リーダー状態
     leader: Option<String>,
@@ -132,7 +154,8 @@ pub struct Raft {
     next_index: HashMap<String, usize>,
     match_index: HashMap<String, usize>,
 
-    state_machine: HashMap<String, RaftValue>,
+    state_machine: Arc<Mutex<dyn StateMachine + Send + Sync>>,
+    pending_requests: VecDeque<PendingRequest>,
     last_applied: usize,
     log: RaftLog,
 }
@@ -144,12 +167,16 @@ enum State {
 }
 
 impl Raft {
-    pub fn start(config: ClusterConfig, node: Arc<Node>) -> mpsc::Sender<RaftRequest> {
+    pub fn start(
+        config: ClusterConfig,
+        transport: Arc<dyn Transport + Send + Sync>,
+        state_machine: Arc<Mutex<dyn StateMachine + Send + Sync>>,
+    ) -> mpsc::Sender<RaftRequest> {
         let (tx0, mut rx0) = mpsc::channel::<RaftRequest>(100);
         let tx1 = tx0.clone();
         info!("Raft instance handling starting...");
         tokio::spawn(async move {
-            let mut raft = Raft::new(config, node, tx0);
+            let mut raft = Raft::new(config, transport, state_machine, tx0);
             raft.start_routines().await;
             loop {
                 debug!("Waiting for Raft request...");
@@ -168,7 +195,8 @@ impl Raft {
 
     pub fn new(
         config: ClusterConfig,
-        node: Arc<Node>,
+        transport: Arc<dyn Transport + Send + Sync>,
+        state_machine: Arc<Mutex<dyn StateMachine + Send + Sync>>,
         raft_sender: mpsc::Sender<RaftRequest>,
     ) -> Self {
         Raft {
@@ -179,18 +207,18 @@ impl Raft {
             election_deadline: Instant::now(),
             step_down_deadline: Instant::now(),
             last_replication: Instant::now(),
-            node,
+            transport,
             raft_sender,
             state: State::Follower,
             term: 0,
             voted_for: None,
             votes: HashSet::new(),
-            cancellation_token: CancellationToken::new(),
             leader: None,
             commit_index: 0,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
-            state_machine: HashMap::new(),
+            state_machine,
+            pending_requests: VecDeque::new(),
             last_applied: 1,
             log: RaftLog::new(),
         }
@@ -205,7 +233,7 @@ impl Raft {
                 let _ = raft_sender
                     .send(RaftRequest {
                         src: node_id.clone(),
-                        request: LinKvRequest::StartElection {},
+                        request: RaftMessage::Internal(InternalMessage::StartElection {}),
                         response_tx: None,
                     })
                     .await;
@@ -219,7 +247,7 @@ impl Raft {
                 let _ = raft_sender
                     .send(RaftRequest {
                         src: node_id.clone(),
-                        request: LinKvRequest::CheckStepDown {},
+                        request: RaftMessage::Internal(InternalMessage::CheckStepDown {}),
                         response_tx: None,
                     })
                     .await;
@@ -234,7 +262,7 @@ impl Raft {
                 let _ = raft_sender
                     .send(RaftRequest {
                         src: node_id.clone(),
-                        request: LinKvRequest::ReplicateLog {},
+                        request: RaftMessage::Internal(InternalMessage::ReplicateLog {}),
                         response_tx: None,
                     })
                     .await;
@@ -279,10 +307,6 @@ impl Raft {
         indexes[indexes.len() / 2]
     }
 
-    fn cancel_election(&self) {
-        self.cancellation_token.cancel();
-    }
-
     fn last_index(&self) -> usize {
         self.log.len()
     }
@@ -322,10 +346,10 @@ impl Raft {
         self.leader = None;
         self.next_index.clear();
         self.match_index.clear();
+        self.pending_requests.clear();
 
         self.reset_election_deadline();
 
-        self.cancel_election();
         debug!("Became follower for term {}", self.term);
     }
 
@@ -345,7 +369,6 @@ impl Raft {
 
         self.reset_step_down_deadline();
         debug!("Became leader for term {}", self.term);
-        self.cancel_election();
     }
 
     pub fn reset_election_deadline(&mut self) {
@@ -379,103 +402,31 @@ impl Raft {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let entry = &self.log[self.last_applied - 1];
-            match &entry.op {
-                LinKvRequest::Read {
-                    origin: _origin,
-                    msg_id,
-                    key,
-                } => {
-                    if self.is_leader() {
-                        match self.state_machine.get(key) {
-                            Some(value) => {
-                                self.node
-                                    .send(
-                                        entry.src.as_str(),
-                                        serde_json::json!({
-                                            "type": "read_ok",
-                                            "in_reply_to": msg_id,
-                                            "value": value,
-                                        }),
-                                    )
-                                    .await;
-                            }
-                            None => {
-                                self.node
-                                    .send(
-                                        entry.src.as_str(),
-                                        serde_json::json!({
-                                            "type": "error",
-                                            "in_reply_to": msg_id,
-                                            "code": 20,
-                                            "text": "Key not found.",
-                                        }),
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                LinKvRequest::Write {
-                    origin: _origin,
-                    msg_id,
-                    key,
-                    value,
-                } => {
-                    self.state_machine.insert(key.clone(), value.clone());
-                    if self.is_leader() {
-                        self.node
-                            .send(
-                                entry.src.as_str(),
-                                serde_json::json!({
-                                    "type": "write_ok",
-                                    "in_reply_to": msg_id,
-                                }),
-                            )
-                            .await;
-                    }
-                }
-                LinKvRequest::Cas {
-                    origin: _origin,
-                    msg_id,
-                    key,
-                    from,
-                    to,
-                } => {
-                    let cas_ok = if let Some(current_value) = self.state_machine.get(key)
-                        && current_value == from
-                    {
-                        self.state_machine.insert(key.clone(), to.clone());
-                        true
+            let command = entry.op.clone();
+            let state_machine_result = self.state_machine.lock().await.apply(command).await;
+            if self.is_leader() {
+                while let Some(pending_request) = self.pending_requests.front() {
+                    if pending_request.log_index >= self.last_applied {
+                        break;
                     } else {
-                        false
-                    };
-                    if self.is_leader() {
-                        if cas_ok {
-                            self.node
-                                .send(
-                                    entry.src.as_str(),
-                                    serde_json::json!({
-                                        "type": "cas_ok",
-                                        "in_reply_to": msg_id,
-                                    }),
-                                )
-                                .await;
-                        } else {
-                            self.node
-                                .send(
-                                    entry.src.as_str(),
-                                    serde_json::json!({
-                                        "type": "error",
-                                        "in_reply_to": msg_id,
-                                        "code": 22,
-                                        "text": "CAS failed.",
-                                    }),
-                                )
-                                .await;
-                        }
+                        self.pending_requests.pop_front();
                     }
                 }
-                _ => {}
+                if let Some(pending_request) = self.pending_requests.front()
+                    && pending_request.log_index == self.last_applied
+                {
+                    let pending_request = self.pending_requests.pop_front().unwrap();
+                    match state_machine_result {
+                        Ok(result) => {
+                            let _ = pending_request
+                                .response_tx
+                                .send(Ok(RaftResponse::Client { result }));
+                        }
+                        Err(e) => {
+                            let _ = pending_request.response_tx.send(Err(e));
+                        }
+                    };
+                }
             }
         }
     }
@@ -491,13 +442,7 @@ impl Raft {
         }
     }
 
-    fn refresh_cancellation_token(&mut self) {
-        self.cancellation_token.cancel();
-        self.cancellation_token = CancellationToken::new();
-    }
-
     fn refresh_election_state(&mut self) {
-        self.refresh_cancellation_token();
         self.voted_for = Some(self.config.node_id.clone());
         self.votes.clear();
         self.votes.insert(self.config.node_id.clone());
@@ -507,64 +452,34 @@ impl Raft {
         let last_log_index = self.last_index();
         let last_log_term = self.last_term();
 
-        let raft_sender = self.raft_sender.clone();
-        let peers = self.config.node_ids.len() - 1;
-        let (tx, mut rx) = mpsc::channel::<Message>(peers);
-
         debug!(
             "Requesting votes from peers, term: {}, last_log_index: {}, last_log_term: {}",
             self.term, last_log_index, last_log_term
         );
 
         self.refresh_election_state();
-        let cancellation_token = self.cancellation_token.clone();
-        tokio::spawn(async move {
-            let mut received = 0;
-            while received < peers {
-                debug!("Waiting for vote responses...");
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        break;
-                    }
-                    message = rx.recv() => {
-                        match message {
-                            Some(message) => {
-                                debug!("Received vote response from {}", message.src);
-                                received += 1;
-                                let res = serde_json::from_value::<LinKvRequest>(message.body);
-                                if let Ok(res) = res {
-                                    let _ = raft_sender.send(RaftRequest {
-                                        src: message.src,
-                                        request: res,
-                                        response_tx: None,
-                                    }).await;
-                                }
-                            }
-                            None => {
-                                debug!("Vote response channel closed");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            debug!("Finished processing vote responses.");
-        });
 
-        self.node
-            .brpc_with_callback(
-                serde_json::json!(
-                    {
-                        "type": "request_vote",
-                        "term": self.term,
-                        "candidate_id": self.config.node_id,
-                        "last_log_index": last_log_index,
-                        "last_log_term": last_log_term,
-                    }
-                ),
-                tx.clone(),
+        let result = self
+            .transport
+            .broadcast(
+                &self
+                    .config
+                    .node_ids
+                    .iter()
+                    .filter(|id| *id != &self.config.node_id)
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                RaftMessage::RPC(RPCMessage::RequestVote {
+                    term: self.term,
+                    candidate_id: self.config.node_id.clone(),
+                    last_log_index,
+                    last_log_term,
+                }),
             )
             .await;
+        if let Err(e) = result {
+            warn!("Failed to broadcast RequestVote RPC: {}", e.message);
+        }
     }
 
     async fn replicate_log(&mut self, force: bool) {
@@ -582,44 +497,29 @@ impl Raft {
                 if next_index > self.log.len() {
                     continue;
                 }
-                if next_index <= self.log.entries.len() || elapsed_time >= self.heartbeat_interval || force {
+                if next_index <= self.log.entries.len()
+                    || elapsed_time >= self.heartbeat_interval
+                    || force
+                {
                     replicated = true;
                     debug!("Replicating log #{}+ to {}", next_index, node_id);
-                    let rx = self
-                        .node
-                        .rpc(
+                    let result = self
+                        .transport
+                        .send(
                             node_id,
-                            serde_json::json!({
-                                "type": "append_entries",
-                                "term": self.term,
-                                "leader_id": self.config.node_id,
-                                "prev_log_index": next_index - 1 ,
-                                "prev_log_term": self.log[next_index - 1].term,
-                                "entries": self.log.entries[next_index - 1..], // entries,
-                                "leader_commit": self.commit_index,
+                            RaftMessage::RPC(RPCMessage::AppendEntries {
+                                term: self.get_term(),
+                                leader_id: self.config.node_id.clone(),
+                                prev_log_index: next_index - 1,
+                                prev_log_term: self.log[next_index - 1].term,
+                                entries: self.log.entries[next_index - 1..].to_vec(),
+                                leader_commit: self.commit_index,
                             }),
                         )
                         .await;
-                    let raft_sender = self.raft_sender.clone();
-                    tokio::spawn(async move {
-                        match rx.await {
-                            Ok(message) => {
-                                let res = serde_json::from_value::<LinKvRequest>(message.body);
-                                if let Ok(res) = res {
-                                    let _ = raft_sender
-                                        .send(RaftRequest {
-                                            src: message.src,
-                                            request: res,
-                                            response_tx: None,
-                                        })
-                                        .await;
-                                }
-                            }
-                            Err(_) => {
-                                debug!("Vote response channel closed");
-                            }
-                        }
-                    });
+                    if let Err(e) = result {
+                        warn!("Failed to send AppendEntries to {}: {}", node_id, e.message);
+                    }
                 }
             }
         }
@@ -633,329 +533,222 @@ impl Raft {
         for request in requests {
             let response_sender = request.response_tx;
             match &request.request {
-                LinKvRequest::Read {
-                    origin: _origin,
-                    msg_id,
-                    key,
-                } => {
-                    debug!("Received read request from {} for key {}", request.src, key);
-                    if self.is_leader() {
-                        self.log.append(RaftLogEntry {
-                            term: self.get_term(),
-                            src: request.src.clone(),
-                            op: request.request.clone(),
-                        });
-                        force_replicate = true;
-                    } else if let Some(leader) = &self.leader {
-                        self.node
-                            .send(
-                                leader,
-                                serde_json::json!({
-                                    "type": "read",
-                                    "msg_id": msg_id,
-                                    "key": key,
-                                    "origin": request.src.clone(),
-                                }),
-                            )
-                            .await;
-                    } else {
-                        self.node
-                            .send(
-                                request.src.as_str(),
-                                serde_json::json!({
-                                    "type": "error",
-                                    "in_reply_to": msg_id,
-                                    "code": 11,
-                                    "text": "No leader elected.",
-                                }),
-                            )
-                            .await;
+                RaftMessage::Internal(internal) => match internal {
+                    InternalMessage::StartElection => {
+                        debug!("Received periodic election check");
+                        if self.passed_election_deadline() {
+                            debug!("Election deadline passed, starting election");
+                            if self.is_leader() {
+                                self.reset_election_deadline();
+                            } else {
+                                self.become_candidate().await;
+                            }
+                        }
                     }
-                }
-                LinKvRequest::Write {
-                    origin: _origin,
-                    msg_id,
-                    key,
-                    value,
-                } => {
-                    if self.is_leader() {
-                        force_replicate = true;
-                        debug!(
-                            "Received write request from {} for key {}, value {}",
-                            request.src, key, value
-                        );
-                        self.log.append(RaftLogEntry {
-                            term: self.get_term(),
-                            src: request.src.clone(),
-                            op: request.request.clone(),
-                        });
-                    } else if let Some(leader) = &self.leader {
-                        self.node
-                            .send(
-                                leader,
-                                serde_json::json!({
-                                    "type": "write",
-                                    "key": key,
-                                    "value": value,
-                                    "msg_id": msg_id,
-                                    "origin": request.src.clone(),
-                                }),
-                            )
-                            .await;
-                    } else {
-                        self.node
-                            .send(
-                                request.src.as_str(),
-                                serde_json::json!({
-                                    "type": "error",
-                                    "in_reply_to": msg_id,
-                                    "code": 11,
-                                    "text": "No leader elected.",
-                                }),
-                            )
-                            .await;
+                    InternalMessage::CheckStepDown => {
+                        if self.is_leader() && Instant::now() >= self.step_down_deadline {
+                            debug!("Stepping down: haven't received acks from followers recently");
+                            self.become_follower();
+                        }
                     }
-                }
-                LinKvRequest::Cas {
-                    origin: _origin,
-                    msg_id,
-                    key,
-                    from,
-                    to,
-                } => {
-                    if self.is_leader() {
-                        force_replicate = true;
-                        debug!(
-                            "Received cas request from {} for key {}, from {}, to {}",
-                            request.src, key, from, to
-                        );
-                        self.log.append(RaftLogEntry {
-                            term: self.get_term(),
-                            src: request.src.clone(),
-                            op: request.request.clone(),
-                        });
-                    } else if let Some(leader) = &self.leader {
-                        self.node
-                            .send(
-                                leader,
-                                serde_json::json!({
-                                    "type": "cas",
-                                    "key": key,
-                                    "from": from,
-                                    "to": to,
-                                    "msg_id": msg_id,
-                                    "origin": request.src.clone(),
-                                }),
-                            )
-                            .await;
-                    } else {
-                        self.node
-                            .send(
-                                request.src.as_str(),
-                                serde_json::json!({
-                                    "type": "error",
-                                    "in_reply_to": msg_id,
-                                    "code": 11,
-                                    "text": "No leader elected.",
-                                }),
-                            )
-                            .await;
+                    InternalMessage::ReplicateLog => {
+                        self.replicate_log(false).await;
+                        continue;
                     }
-                }
-                LinKvRequest::RequestVote {
-                    term,
-                    candidate_id,
-                    last_log_index,
-                    last_log_term,
-                } => {
-                    debug!(
-                        "Received vote request from {} for term {}",
-                        candidate_id, term
-                    );
-                    self.maybe_step_down(*term);
-
-                    let mut vote_granted = false;
-                    if *term < self.get_term() {
-                        debug!(
-                            "Candidate term {} is less than current term {}",
-                            term,
-                            self.get_term()
-                        );
-                    } else if self.is_voted() && self.get_voted_for() != *candidate_id {
-                        debug!("Already voted for {}", self.get_voted_for());
-                    } else if !self
-                        .is_candidate_log_up_to_date(*last_log_index as usize, *last_log_term)
-                    {
-                        debug!(
-                            "Our logs are both at term {}, but candidate's log is not up-to-date",
-                            last_log_term
-                        );
-                    } else {
-                        debug!("Voted for candidate {}", candidate_id);
-                        vote_granted = true;
-                        self.set_voted_for(candidate_id.clone());
-                        self.reset_election_deadline();
-                    }
-
-                    if let Some(sender) = response_sender {
-                        sender
-                            .send(Ok(serde_json::json!({
-                                "type": "request_vote_res",
-                                "term": self.get_term(),
-                                "vote_granted": vote_granted,
-                            })))
-                            .unwrap();
-                    }
-                }
-                LinKvRequest::StartElection {} => {
-                    debug!("Received periodic election check");
-                    if self.passed_election_deadline() {
-                        debug!("Election deadline passed, starting election");
+                },
+                RaftMessage::Client(client_request) => match client_request {
+                    ClientRequest::Command { op } => {
                         if self.is_leader() {
-                            self.reset_election_deadline();
-                        } else {
-                            self.become_candidate().await;
-                        }
-                    }
-                }
-                LinKvRequest::RequestVoteRes { term, vote_granted } => {
-                    debug!("Received vote response for term {}: {}", term, vote_granted);
-                    self.reset_step_down_deadline();
-                    self.maybe_step_down(*term);
-                    if self.is_candidate() && self.term == *term && *vote_granted {
-                        debug!("Received vote from {}", request.src);
-                        self.votes.insert(request.src);
-                        if self.votes.len() >= majority(self.config.node_ids.len()) {
-                            debug!("Becoming leader for term {}", self.term);
-                            self.become_leader();
-                        }
-                    }
-                }
-                LinKvRequest::CheckStepDown {} => {
-                    if self.is_leader() && Instant::now() >= self.step_down_deadline {
-                        debug!("Stepping down: haven't received acks from followers recently");
-                        self.become_follower();
-                    }
-                }
-                LinKvRequest::AppendEntries {
-                    term,
-                    leader_id,
-                    prev_log_index,
-                    prev_log_term,
-                    entries,
-                    leader_commit,
-                } => {
-                    debug!(
-                        "Received append entries from leader {} for term {}, prev_log_index {}, prev_log_term {}, leader_commit {}",
-                        leader_id, term, prev_log_index, prev_log_term, leader_commit
-                    );
-                    debug!(
-                        "Current term {}, log length {}",
-                        self.get_term(),
-                        self.log.len()
-                    );
-
-                    self.maybe_step_down(*term);
-
-                    if *term < self.get_term() {
-                        if let Some(response_sender) = response_sender {
-                            response_sender
-                                .send(Ok(serde_json::json!({
-                                    "type": "append_entries_res",
-                                    "term": self.get_term(),
-                                    "success": false,
-                                    "next_index": 0,
-                                })))
-                                .unwrap();
-                        }
-                        continue;
-                    }
-
-                    self.leader = Some(leader_id.clone());
-                    self.reset_election_deadline();
-
-                    if self.log.len() < *prev_log_index as usize
-                        || (*prev_log_index > 0
-                            && self.log[*prev_log_index as usize - 1].term != *prev_log_term)
-                    {
-                        if let Some(response_sender) = response_sender {
-                            response_sender
-                                .send(Ok(serde_json::json!({
-                                    "type": "append_entries_res",
-                                    "term": self.get_term(),
-                                    "success": false,
-                                    "next_index": 1,
-                                })))
-                                .unwrap();
-                        }
-                        continue;
-                    }
-
-                    let mut log_insert_index = *prev_log_index as usize;
-                    for entry in entries {
-                        if log_insert_index >= self.log.len() {
-                            self.log.append(entry.clone());
-                        } else if self.log[log_insert_index].term != entry.term {
-                            self.log.truncate(log_insert_index);
-                            self.log.append(entry.clone());
-                        }
-                        log_insert_index += 1;
-                    }
-
-                    if *leader_commit as usize > self.commit_index {
-                        self.commit_index = std::cmp::min(*leader_commit as usize, self.log.len());
-                        self.advance_state_machine().await;
-                    }
-
-                    if let Some(response_sender) = response_sender {
-                        response_sender
-                            .send(Ok(serde_json::json!({
-                                    "type": "append_entries_res",
-                                    "term": self.get_term(),
-                                    "success": true,
-                                    "next_index": self.log.len() + 1,
-                            })))
-                            .unwrap();
-                    }
-                }
-                LinKvRequest::AppendEntriesRes {
-                    term,
-                    success,
-                    next_index,
-                } => {
-                    debug!(
-                        "Received append entries response for term {}: success={}, next_index {}",
-                        term, success, next_index
-                    );
-                    self.maybe_step_down(*term);
-                    if self.is_leader() && self.term == *term {
-                        self.reset_step_down_deadline();
-                        if *success {
-                            self.next_index
-                                .entry(request.src.clone())
-                                .and_modify(|index| {
-                                    *index = *next_index as usize;
+                            self.log.append(RaftLogEntry {
+                                term: self.get_term(),
+                                op: op.clone(),
+                            });
+                            if let Some(sender) = response_sender {
+                                self.pending_requests.push_back(PendingRequest {
+                                    log_index: self.last_index(),
+                                    response_tx: sender,
                                 });
-                            self.match_index.entry(request.src).and_modify(|index| {
-                                *index = *next_index as usize - 1;
-                            });
-                            self.advance_commit_index().await;
-                        } else {
-                            self.next_index.entry(request.src).and_modify(|index| {
-                                if *index > 0 {
-                                    *index -= 1;
-                                }
-                            });
+                            }
+                            force_replicate = true;
+                        } else if let Some(leader) = &self.leader {
+                            if let Some(response_sender) = response_sender {
+                                let _ = response_sender.send(Err(RaftError::Redirect {
+                                    leader_id: leader.clone(),
+                                }));
+                            }
+                        } else if let Some(response_sender) = response_sender {
+                            let _ = response_sender
+                                .send(Err(RaftError::NoLeader("No leader elected".to_string())));
                         }
                     }
-                }
-                LinKvRequest::ReplicateLog {} => {
-                    self.replicate_log(false).await;
-                    continue;
-                }
-                _ => {
-                    warn!("Received unknown request type: {:?}", request.request);
-                }
+                },
+                RaftMessage::RPC(rpc_request) => match rpc_request {
+                    RPCMessage::RequestVote {
+                        term,
+                        candidate_id,
+                        last_log_index,
+                        last_log_term,
+                    } => {
+                        debug!(
+                            "Received vote request from {} for term {}",
+                            candidate_id, term
+                        );
+                        self.maybe_step_down(*term);
+
+                        let mut vote_granted = false;
+                        if *term < self.get_term() {
+                            debug!(
+                                "Candidate term {} is less than current term {}",
+                                term,
+                                self.get_term()
+                            );
+                        } else if self.is_voted() && self.get_voted_for() != *candidate_id {
+                            debug!("Already voted for {}", self.get_voted_for());
+                        } else if !self.is_candidate_log_up_to_date(*last_log_index, *last_log_term)
+                        {
+                            debug!(
+                                "Our logs are both at term {}, but candidate's log is not up-to-date",
+                                last_log_term
+                            );
+                        } else {
+                            debug!("Voted for candidate {}", candidate_id);
+                            vote_granted = true;
+                            self.set_voted_for(candidate_id.clone());
+                            self.reset_election_deadline();
+                        }
+
+                        if let Some(sender) = response_sender {
+                            sender
+                                .send(Ok(RaftResponse::RPC(RPCMessage::RequestVoteRes {
+                                    term: self.get_term(),
+                                    vote_granted,
+                                })))
+                                .unwrap();
+                        }
+                    }
+                    RPCMessage::RequestVoteRes { term, vote_granted } => {
+                        debug!("Received vote response for term {}: {}", term, vote_granted);
+                        self.reset_step_down_deadline();
+                        self.maybe_step_down(*term);
+                        if self.is_candidate() && self.term == *term && *vote_granted {
+                            debug!("Received vote from {}", request.src);
+                            self.votes.insert(request.src);
+                            if self.votes.len() >= majority(self.config.node_ids.len()) {
+                                debug!("Becoming leader for term {}", self.term);
+                                self.become_leader();
+                            }
+                        }
+                    }
+                    RPCMessage::AppendEntries {
+                        term,
+                        leader_id,
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        leader_commit,
+                    } => {
+                        debug!(
+                            "Received append entries from leader {} for term {}, prev_log_index {}, prev_log_term {}, leader_commit {}",
+                            leader_id, term, prev_log_index, prev_log_term, leader_commit
+                        );
+                        debug!(
+                            "Current term {}, log length {}",
+                            self.get_term(),
+                            self.log.len()
+                        );
+
+                        self.maybe_step_down(*term);
+
+                        if *term < self.get_term() {
+                            if let Some(response_sender) = response_sender {
+                                response_sender
+                                    .send(Ok(RaftResponse::RPC(RPCMessage::AppendEntriesRes {
+                                        term: self.get_term(),
+                                        success: false,
+                                        next_index: 0,
+                                    })))
+                                    .unwrap();
+                            }
+                            continue;
+                        }
+
+                        self.leader = Some(leader_id.clone());
+                        self.reset_election_deadline();
+
+                        if self.log.len() < *prev_log_index
+                            || (*prev_log_index > 0
+                                && self.log[*prev_log_index - 1].term != *prev_log_term)
+                        {
+                            if let Some(response_sender) = response_sender {
+                                response_sender
+                                    .send(Ok(RaftResponse::RPC(RPCMessage::AppendEntriesRes {
+                                        term: self.get_term(),
+                                        success: false,
+                                        next_index: 1,
+                                    })))
+                                    .unwrap();
+                            }
+                            continue;
+                        }
+
+                        let mut log_insert_index = *prev_log_index;
+                        for entry in entries {
+                            if log_insert_index >= self.log.len() {
+                                self.log.append(entry.clone());
+                            } else if self.log[log_insert_index].term != entry.term {
+                                self.log.truncate(log_insert_index);
+                                self.log.append(entry.clone());
+                            }
+                            log_insert_index += 1;
+                        }
+
+                        if *leader_commit > self.commit_index {
+                            self.commit_index = std::cmp::min(*leader_commit, self.log.len());
+                            self.advance_state_machine().await;
+                        }
+
+                        if let Some(response_sender) = response_sender {
+                            response_sender
+                                .send(Ok(RaftResponse::RPC(RPCMessage::AppendEntriesRes {
+                                    term: self.get_term(),
+                                    success: true,
+                                    next_index: self.log.len() + 1,
+                                })))
+                                .unwrap();
+                        }
+                    }
+                    RPCMessage::AppendEntriesRes {
+                        term,
+                        success,
+                        next_index,
+                    } => {
+                        debug!(
+                            "Received append entries response for term {}: success={}, next_index {}",
+                            term, success, next_index
+                        );
+                        self.maybe_step_down(*term);
+                        if self.is_leader() && self.term == *term {
+                            self.reset_step_down_deadline();
+                            if *success {
+                                self.next_index
+                                    .entry(request.src.clone())
+                                    .and_modify(|index| {
+                                        *index = *next_index;
+                                    });
+                                self.match_index.entry(request.src).and_modify(|index| {
+                                    *index = *next_index - 1;
+                                });
+                                self.advance_commit_index().await;
+                            } else {
+                                self.next_index.entry(request.src).and_modify(|index| {
+                                    if *index > 0 {
+                                        *index -= 1;
+                                    }
+                                });
+                            }
+                        }
+                    }
+                },
             }
         }
         self.replicate_log(force_replicate).await;
@@ -969,8 +762,7 @@ pub struct RaftLog {
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct RaftLogEntry {
     term: u64,
-    src: String,
-    op: LinKvRequest,
+    op: Vec<u8>,
 }
 
 impl RaftLog {
@@ -978,11 +770,7 @@ impl RaftLog {
         RaftLog {
             entries: vec![RaftLogEntry {
                 term: 0,
-                src: "".to_string(),
-                op: LinKvRequest::Init {
-                    node_id: "".to_string(),
-                    node_ids: vec![],
-                },
+                op: vec![],
             }],
         }
     }

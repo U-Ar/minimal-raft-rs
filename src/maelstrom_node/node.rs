@@ -11,7 +11,10 @@ use tokio::{
     sync::{Mutex, OnceCell, mpsc, oneshot},
 };
 
-use crate::maelstrom_node::error::RPCError;
+use crate::{
+    maelstrom_node::error::RPCError,
+    raft::{RaftMessage, Transport, TransportError},
+};
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Message {
@@ -160,7 +163,7 @@ impl Node {
             let mut callbacks = self.inner.callbacks.lock().await;
             callbacks.insert(msg_id, CallbackSender::OneShot(tx));
         }
-        self.send(dest, body).await;
+        self.send_body(dest, body).await;
         rx
     }
 
@@ -195,7 +198,7 @@ impl Node {
                     let mut callbacks = self.inner.callbacks.lock().await;
                     callbacks.insert(msg_id, CallbackSender::Mpsc(callback));
                 }
-                self.send(dest, send_body).await;
+                self.send_body(dest, send_body).await;
             }
             _ => {
                 debug!("Message body to {} must be a JSON object: {:?}", dest, body);
@@ -217,7 +220,7 @@ impl Node {
         }
     }
 
-    pub async fn send(&self, dest: &str, body: serde_json::Value) {
+    pub async fn send_body(&self, dest: &str, body: serde_json::Value) {
         let out_message = Message {
             src: self.inner.get_membership().node_id.clone(),
             dest: dest.to_string(),
@@ -244,7 +247,7 @@ impl Node {
                     serde_json::Value::Number(in_reply_to.into()),
                 );
                 let send_body = serde_json::Value::Object(map.clone());
-                self.send(reply_dest, send_body).await;
+                self.send_body(reply_dest, send_body).await;
             }
             _ => {
                 warn!(
@@ -297,6 +300,53 @@ impl Node {
                 };
             });
         }
+    }
+}
+
+#[async_trait]
+impl Transport for Node {
+    async fn send(&self, target: &str, message: RaftMessage) -> Result<(), TransportError> {
+        debug!("Sending message to {}: {:?}", target, message);
+        let mut body = serde_json::to_value(&message).unwrap();
+        if body.get("msg_id").is_none() {
+            let msg_id = self
+                .inner
+                .msg_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let serde_json::Value::Object(ref mut map) = body {
+                map.insert(
+                    "msg_id".to_string(),
+                    serde_json::Value::Number(msg_id.into()),
+                );
+            }
+        }
+        self.send_body(target, body).await;
+        Ok(())
+    }
+
+    async fn broadcast(
+        &self,
+        targets: &[String],
+        message: RaftMessage,
+    ) -> Result<(), TransportError> {
+        debug!("Broadcasting message to {:?}: {:?}", targets, message);
+        for target in targets {
+            let mut body = serde_json::to_value(&message).unwrap();
+            if body.get("msg_id").is_none() {
+                let msg_id = self
+                    .inner
+                    .msg_id
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let serde_json::Value::Object(ref mut map) = body {
+                    map.insert(
+                        "msg_id".to_string(),
+                        serde_json::Value::Number(msg_id.into()),
+                    );
+                }
+            }
+            self.send_body(target, body).await;
+        }
+        Ok(())
     }
 }
 
