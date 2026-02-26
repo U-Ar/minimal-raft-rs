@@ -66,6 +66,7 @@ pub enum LinKvRequest {
         term: u64,
         success: bool,
         next_index: u64,
+        conflict_index: Option<u64>,
     },
 }
 
@@ -410,6 +411,7 @@ impl Handler for RaftHandler {
                 term,
                 success,
                 next_index,
+                conflict_index,
             } => {
                 match self
                     .process_raft_request_with_no_response(
@@ -418,6 +420,7 @@ impl Handler for RaftHandler {
                             term: *term,
                             success: *success,
                             next_index: *next_index as usize,
+                            conflict_index: conflict_index.map(|idx| idx as usize),
                         }),
                     )
                     .await

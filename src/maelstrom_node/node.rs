@@ -312,7 +312,7 @@ impl Transport for Node {
             let msg_id = self
                 .inner
                 .msg_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let serde_json::Value::Object(ref mut map) = body {
                 map.insert(
                     "msg_id".to_string(),
@@ -336,7 +336,7 @@ impl Transport for Node {
                 let msg_id = self
                     .inner
                     .msg_id
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let serde_json::Value::Object(ref mut map) = body {
                     map.insert(
                         "msg_id".to_string(),

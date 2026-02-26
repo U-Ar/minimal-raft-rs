@@ -94,6 +94,8 @@ pub enum RPCMessage {
         term: u64,
         success: bool,
         next_index: usize,
+        // prev_logが一致しなかったとき、最低限同期するべき(termが一致しない/ログが足りない)最初のログエントリのインデックス
+        conflict_index: Option<usize>,
     },
 }
 
@@ -666,6 +668,7 @@ impl Raft {
                                         term: self.get_term(),
                                         success: false,
                                         next_index: 0,
+                                        conflict_index: None,
                                     })))
                                     .unwrap();
                             }
@@ -675,16 +678,38 @@ impl Raft {
                         self.leader = Some(leader_id.clone());
                         self.reset_election_deadline();
 
-                        if self.log.len() < *prev_log_index
-                            || (*prev_log_index > 0
-                                && self.log[*prev_log_index - 1].term != *prev_log_term)
-                        {
+                        if self.log.len() < *prev_log_index {
                             if let Some(response_sender) = response_sender {
                                 response_sender
                                     .send(Ok(RaftResponse::RPC(RPCMessage::AppendEntriesRes {
                                         term: self.get_term(),
                                         success: false,
                                         next_index: 1,
+                                        conflict_index: Some(self.log.len() + 1),
+                                    })))
+                                    .unwrap();
+                            }
+                            continue;
+                        }
+                        if *prev_log_index > 0
+                            && self.log[*prev_log_index - 1].term != *prev_log_term
+                        {
+                            if let Some(response_sender) = response_sender {
+                                response_sender
+                                    .send(Ok(RaftResponse::RPC(RPCMessage::AppendEntriesRes {
+                                        term: self.get_term(),
+                                        success: false,
+                                        next_index: self.log.len() + 1,
+                                        conflict_index: Some(
+                                            self.log
+                                                .entries
+                                                .iter()
+                                                .position(|entry| {
+                                                    entry.term == self.log[*prev_log_index - 1].term
+                                                })
+                                                .unwrap_or(0)
+                                                + 1,
+                                        ),
                                     })))
                                     .unwrap();
                             }
@@ -713,6 +738,7 @@ impl Raft {
                                     term: self.get_term(),
                                     success: true,
                                     next_index: self.log.len() + 1,
+                                    conflict_index: None,
                                 })))
                                 .unwrap();
                         }
@@ -721,6 +747,7 @@ impl Raft {
                         term,
                         success,
                         next_index,
+                        conflict_index,
                     } => {
                         debug!(
                             "Received append entries response for term {}: success={}, next_index {}",
@@ -739,6 +766,10 @@ impl Raft {
                                     *index = *next_index - 1;
                                 });
                                 self.advance_commit_index().await;
+                            } else if let Some(conflict_index) = conflict_index {
+                                self.next_index.entry(request.src).and_modify(|index| {
+                                    *index = *conflict_index;
+                                });
                             } else {
                                 self.next_index.entry(request.src).and_modify(|index| {
                                     if *index > 0 {
