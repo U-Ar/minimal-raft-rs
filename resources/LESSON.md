@@ -69,15 +69,18 @@ pub fn run(&mut self) {
   - (DONE)Initのやり方を変える
     - (DONE)ふつうはRaft::startの時にクラスタコンフィグを与えて開始したいはず
     - (DONE)Raft::startしてhandle_requestで非同期的にinitを受け取るんじゃなくて、initメッセージの処理はRaftHandlerの側で行う。クラスタコンフィグを受け取ったらそれを与えてRaftインスタンスを開始する
-- RaftStateMachineの一般化
-  - まずは既存のものをHashMapStateMachineにする
-    - ログのコマンドはRaft本体では関知しないようにする(Vecu8にする)
-- node.rsとraft.rsの依存性分離
-  - Transportトレイトを定義してraftはTransportを持つようにする
-  - RaftにTransportを渡して初期化、channelを生成。RaftHandlerにRaftのchannelを渡す。RaftHandlerはreceiveに関するつなぎ
-    - send: Raft自身がTransportに送る
-    - receive: Node -> RaftHandler -> Raftのchannelへ送信 という流れ
-- RaftHandlerとRaftを分離する。LinKvRequestとRaftRequestを別にする
-- RaftStorageの一般化
+- (DONE)RaftStateMachineの一般化
+  - (DONE)まずは既存のものをHashMapStateMachineにする
+    - (DONE)ログのコマンドはRaft本体では関知しないようにする(Vecu8にする)
+- (DONE)node.rsとraft.rsの依存性分離
+  - (DONE)Transportトレイトを定義してraftはTransportを持つようにする
+  - (DONE)RaftにTransportを渡して初期化、channelを生成。RaftHandlerにRaftのchannelを渡す。RaftHandlerはreceiveに関するつなぎ
+    - (DONE)send: Raft自身がTransportに送る
+    - (DONE)receive: Node -> RaftHandler -> Raftのchannelへ送信 という流れ
+- (DONE)RaftHandlerとRaftを分離する。LinKvRequestとRaftRequestを別にする
+- ログストレージの一般化
+  - WALによる永続化のサポート
+  - スナップショットをサポート
+- LSM-Treeの実装
 - read index最適化を入れる
 
